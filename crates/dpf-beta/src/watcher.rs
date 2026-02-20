@@ -34,8 +34,10 @@
 //!     .start();
 //! ```
 
-use std::future::Future;
 use std::sync::Arc;
+
+use futures::FutureExt;
+use futures::future::BoxFuture;
 
 use crate::crds::dpus_generated::{DPU, DpuStatusPhase};
 use crate::error::DpfError;
@@ -44,29 +46,14 @@ use crate::types::{
     DpuErrorEvent, DpuEvent, DpuPhase, DpuReadyEvent, MaintenanceEvent, RebootRequiredEvent,
 };
 
-/// Callback for DPU state changes. Implemented automatically for all `Fn(T) -> Future`.
-/// Purpose is to allow for generic async callbacks without having to box and pin the closure.
-pub trait DPUStateCallback<T>: Fn(T) -> Self::Fut + Send + Sync + 'static {
-    type Fut: Future<Output = Result<(), DpfError>> + Send + 'static;
-}
+type DpuCallbackFn<T> = Box<dyn Fn(T) -> BoxFuture<'static, Result<(), DpfError>> + Send + Sync>;
 
-impl<T, F, Fut> DPUStateCallback<T> for F
-where
-    F: Fn(T) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<(), DpfError>> + Send + 'static,
-{
-    type Fut = Fut;
-}
-
-// for defaulting to no-op callbacks in the builder
-type NoopFn<T> = fn(T) -> std::future::Ready<Result<(), DpfError>>;
-
-struct Callbacks<DE, RB, RD, MN, ER> {
-    dpu_event: DE,
-    reboot: RB,
-    ready: RD,
-    maintenance: MN,
-    error: ER,
+struct Callbacks {
+    dpu_event: DpuCallbackFn<DpuEvent>,
+    reboot: DpuCallbackFn<RebootRequiredEvent>,
+    ready: DpuCallbackFn<DpuReadyEvent>,
+    maintenance: DpuCallbackFn<MaintenanceEvent>,
+    error: DpuCallbackFn<DpuErrorEvent>,
 }
 
 /// The watcher only cares about how the events are translated into the callbacks,
@@ -84,17 +71,10 @@ impl Drop for DpuWatcher {
 }
 
 /// Builder for creating a DPU watcher.
-pub struct DpuWatcherBuilder<
-    R: DpuRepository,
-    DE = NoopFn<DpuEvent>,
-    RB = NoopFn<RebootRequiredEvent>,
-    RD = NoopFn<DpuReadyEvent>,
-    MN = NoopFn<MaintenanceEvent>,
-    ER = NoopFn<DpuErrorEvent>,
-> {
+pub struct DpuWatcherBuilder<R: DpuRepository> {
     repo: Arc<R>,
     namespace: String,
-    cbs: Callbacks<DE, RB, RD, MN, ER>,
+    cbs: Callbacks,
 }
 
 impl<R: DpuRepository> DpuWatcherBuilder<R> {
@@ -103,11 +83,11 @@ impl<R: DpuRepository> DpuWatcherBuilder<R> {
             repo,
             namespace: namespace.into(),
             cbs: Callbacks {
-                dpu_event: |_| std::future::ready(Ok(())),
-                reboot: |_| std::future::ready(Ok(())),
-                ready: |_| std::future::ready(Ok(())),
-                maintenance: |_| std::future::ready(Ok(())),
-                error: |_| std::future::ready(Ok(())),
+                dpu_event: Box::new(|_| std::future::ready(Ok(())).boxed()),
+                reboot: Box::new(|_| std::future::ready(Ok(())).boxed()),
+                ready: Box::new(|_| std::future::ready(Ok(())).boxed()),
+                maintenance: Box::new(|_| std::future::ready(Ok(())).boxed()),
+                error: Box::new(|_| std::future::ready(Ok(())).boxed()),
             },
         }
     }
@@ -115,12 +95,12 @@ impl<R: DpuRepository> DpuWatcherBuilder<R> {
 
 /// This is a type state builder pattern. It's extra boilerplate, but we get generic
 /// function types for the callbacks instead of boxing and pinning the closures.
-impl<R: DpuRepository, DE, RB, RD, MN, ER> DpuWatcherBuilder<R, DE, RB, RD, MN, ER> {
+impl<R: DpuRepository> DpuWatcherBuilder<R> {
     /// Register a callback for DPU events.
     ///
     /// The callback is invoked on every observed update to a DPU, not only
     /// on phase transitions. The handler must be idempotent.
-    pub fn on_dpu_event<F, Fut>(self, callback: F) -> DpuWatcherBuilder<R, F, RB, RD, MN, ER>
+    pub fn on_dpu_event<F, Fut>(self, callback: F) -> DpuWatcherBuilder<R>
     where
         F: Fn(DpuEvent) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), DpfError>> + Send + 'static,
@@ -129,7 +109,7 @@ impl<R: DpuRepository, DE, RB, RD, MN, ER> DpuWatcherBuilder<R, DE, RB, RD, MN, 
             repo: self.repo,
             namespace: self.namespace,
             cbs: Callbacks {
-                dpu_event: callback,
+                dpu_event: Box::new(move |event| callback(event).boxed()),
                 reboot: self.cbs.reboot,
                 ready: self.cbs.ready,
                 maintenance: self.cbs.maintenance,
@@ -145,7 +125,7 @@ impl<R: DpuRepository, DE, RB, RD, MN, ER> DpuWatcherBuilder<R, DE, RB, RD, MN, 
     ///
     /// Return `Ok(())` to acknowledge the event. Return `Err` to have the
     /// repository implementation retry after a backoff period.
-    pub fn on_reboot_required<F, Fut>(self, callback: F) -> DpuWatcherBuilder<R, DE, F, RD, MN, ER>
+    pub fn on_reboot_required<F, Fut>(self, callback: F) -> DpuWatcherBuilder<R>
     where
         F: Fn(RebootRequiredEvent) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), DpfError>> + Send + 'static,
@@ -155,7 +135,7 @@ impl<R: DpuRepository, DE, RB, RD, MN, ER> DpuWatcherBuilder<R, DE, RB, RD, MN, 
             namespace: self.namespace,
             cbs: Callbacks {
                 dpu_event: self.cbs.dpu_event,
-                reboot: callback,
+                reboot: Box::new(move |event| callback(event).boxed()),
                 ready: self.cbs.ready,
                 maintenance: self.cbs.maintenance,
                 error: self.cbs.error,
@@ -167,7 +147,7 @@ impl<R: DpuRepository, DE, RB, RD, MN, ER> DpuWatcherBuilder<R, DE, RB, RD, MN, 
     ///
     /// Invoked on every update where the DPU is in the Ready phase, not
     /// only on transitions into that phase. The handler must be idempotent.
-    pub fn on_dpu_ready<F, Fut>(self, callback: F) -> DpuWatcherBuilder<R, DE, RB, F, MN, ER>
+    pub fn on_dpu_ready<F, Fut>(self, callback: F) -> DpuWatcherBuilder<R>
     where
         F: Fn(DpuReadyEvent) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), DpfError>> + Send + 'static,
@@ -178,7 +158,7 @@ impl<R: DpuRepository, DE, RB, RD, MN, ER> DpuWatcherBuilder<R, DE, RB, RD, MN, 
             cbs: Callbacks {
                 dpu_event: self.cbs.dpu_event,
                 reboot: self.cbs.reboot,
-                ready: callback,
+                ready: Box::new(move |event| callback(event).boxed()),
                 maintenance: self.cbs.maintenance,
                 error: self.cbs.error,
             },
@@ -192,10 +172,7 @@ impl<R: DpuRepository, DE, RB, RD, MN, ER> DpuWatcherBuilder<R, DE, RB, RD, MN, 
     ///
     /// Return `Ok(())` to acknowledge the event. Return `Err` to have the
     /// repository implementation retry after a backoff period.
-    pub fn on_maintenance_needed<F, Fut>(
-        self,
-        callback: F,
-    ) -> DpuWatcherBuilder<R, DE, RB, RD, F, ER>
+    pub fn on_maintenance_needed<F, Fut>(self, callback: F) -> DpuWatcherBuilder<R>
     where
         F: Fn(MaintenanceEvent) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), DpfError>> + Send + 'static,
@@ -207,7 +184,7 @@ impl<R: DpuRepository, DE, RB, RD, MN, ER> DpuWatcherBuilder<R, DE, RB, RD, MN, 
                 dpu_event: self.cbs.dpu_event,
                 reboot: self.cbs.reboot,
                 ready: self.cbs.ready,
-                maintenance: callback,
+                maintenance: Box::new(move |event| callback(event).boxed()),
                 error: self.cbs.error,
             },
         }
@@ -220,7 +197,7 @@ impl<R: DpuRepository, DE, RB, RD, MN, ER> DpuWatcherBuilder<R, DE, RB, RD, MN, 
     ///
     /// Return `Ok(())` to acknowledge the event. Return `Err` to have the
     /// repository implementation retry after a backoff period.
-    pub fn on_error<F, Fut>(self, callback: F) -> DpuWatcherBuilder<R, DE, RB, RD, MN, F>
+    pub fn on_error<F, Fut>(self, callback: F) -> DpuWatcherBuilder<R>
     where
         F: Fn(DpuErrorEvent) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), DpfError>> + Send + 'static,
@@ -233,20 +210,15 @@ impl<R: DpuRepository, DE, RB, RD, MN, ER> DpuWatcherBuilder<R, DE, RB, RD, MN, 
                 reboot: self.cbs.reboot,
                 ready: self.cbs.ready,
                 maintenance: self.cbs.maintenance,
-                error: callback,
+                error: Box::new(move |event| callback(event).boxed()),
             },
         }
     }
 }
 
-impl<R, DE, RB, RD, MN, ER> DpuWatcherBuilder<R, DE, RB, RD, MN, ER>
+impl<R> DpuWatcherBuilder<R>
 where
     R: DpuRepository,
-    DE: DPUStateCallback<DpuEvent>,
-    RB: DPUStateCallback<RebootRequiredEvent>,
-    RD: DPUStateCallback<DpuReadyEvent>,
-    MN: DPUStateCallback<MaintenanceEvent>,
-    ER: DPUStateCallback<DpuErrorEvent>,
 {
     /// Start watching for events.
     ///
