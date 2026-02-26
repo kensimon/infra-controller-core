@@ -1,0 +1,143 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+use ::rpc::admin_cli::CarbideCliResult;
+pub use args::Args;
+
+use crate::cfg::run::Run;
+use crate::cfg::runtime::RuntimeContext;
+
+pub mod args {
+    use clap::Parser;
+
+    use crate::extension_service::common::ExtensionServiceType;
+
+    #[derive(Parser, Debug)]
+    pub struct Args {
+        #[clap(
+            short = 'i',
+            long,
+            help = "The extension service ID to show (leave empty to show all)"
+        )]
+        pub id: Option<String>,
+
+        #[clap(short = 't', long = "type", help = "Filter by service type (optional)")]
+        pub service_type: Option<ExtensionServiceType>,
+
+        #[clap(short = 'n', long = "name", help = "Filter by service name (optional)")]
+        pub service_name: Option<String>,
+
+        #[clap(
+            short = 'o',
+            long,
+            help = "Filter by tenant organization ID (optional)"
+        )]
+        pub tenant_organization_id: Option<String>,
+    }
+}
+
+pub mod cmd {
+    use ::rpc::admin_cli::output::OutputFormat;
+    use ::rpc::forge::{DpuExtensionService, DpuExtensionServiceType};
+    use prettytable::{Table, row};
+
+    use super::args::Args;
+    use super::*;
+    use crate::rpc::ApiClient;
+
+    pub async fn handle_show(
+        args: Args,
+        output_format: OutputFormat,
+        api_client: &ApiClient,
+        page_size: usize,
+    ) -> CarbideCliResult<()> {
+        let is_json = output_format == OutputFormat::Json;
+
+        let services = if let Some(id) = args.id {
+            let service = api_client.get_extension_service_by_id(id).await?;
+            vec![service]
+        } else {
+            let service_list = api_client
+                .find_extension_services(
+                    args.service_type.map(|t| t as i32),
+                    args.service_name,
+                    args.tenant_organization_id,
+                    page_size,
+                )
+                .await?;
+            service_list.services
+        };
+
+        if is_json {
+            println!("{}", serde_json::to_string_pretty(&services)?);
+        } else {
+            convert_extension_services_to_table(&services).printstd();
+        }
+
+        Ok(())
+    }
+
+    pub fn convert_extension_services_to_table(services: &[DpuExtensionService]) -> Box<Table> {
+        let mut table = Table::new();
+
+        table.set_titles(row![
+            "Service ID",
+            "Name",
+            "Type",
+            "Tenant Organization ID",
+            "Version Counter",
+            "Active Versions",
+            "Description",
+            "Created",
+            "Updated",
+        ]);
+
+        for service in services {
+            let service_type_name = DpuExtensionServiceType::try_from(service.service_type)
+                .map(|t| t.as_str_name())
+                .unwrap_or("Unknown");
+
+            let active_versions = service.active_versions.join(", ");
+
+            table.add_row(row![
+                service.service_id,
+                service.service_name,
+                service_type_name,
+                service.tenant_organization_id,
+                service.version_ctr,
+                active_versions,
+                service.description,
+                service.created,
+                service.updated,
+            ]);
+        }
+
+        table.into()
+    }
+}
+
+impl Run for Args {
+    async fn run(self, ctx: &mut RuntimeContext) -> CarbideCliResult<()> {
+        cmd::handle_show(
+            self,
+            ctx.config.format,
+            &ctx.api_client,
+            ctx.config.page_size,
+        )
+        .await
+    }
+}

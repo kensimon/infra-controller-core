@@ -20,14 +20,14 @@ use std::collections::HashMap;
 use ::rpc::admin_cli::{CarbideCliError, CarbideCliResult};
 use ::rpc::forge::instance_interface_config::NetworkDetails;
 use ::rpc::forge::{
-    self as rpc, BmcEndpointRequest, CreateNetworkSecurityGroupRequest,
-    FindInstanceTypesByIdsRequest, FindNetworkSecurityGroupsByIdsRequest, GetDpfStateRequest,
+    BmcEndpointRequest, CreateNetworkSecurityGroupRequest, FindInstanceTypesByIdsRequest,
+    FindNetworkSecurityGroupsByIdsRequest, GetDpfStateRequest,
     GetNetworkSecurityGroupAttachmentsRequest, GetNetworkSecurityGroupPropagationStatusRequest,
     IdentifySerialRequest, MachineHardwareInfo, MachineHardwareInfoUpdateType,
     ModifyDpfStateRequest, NetworkPrefix, NetworkSecurityGroupAttributes,
     NetworkSegmentCreationRequest, NetworkSegmentType, Remediation, RemediationIdList,
     RemediationList, UpdateMachineHardwareInfoRequest, UpdateNetworkSecurityGroupRequest,
-    VpcCreationRequest, VpcSearchFilter, VpcVirtualizationType, VpcsByIdsRequest,
+    VpcCreationRequest, VpcSearchFilter, VpcVirtualizationType, VpcsByIdsRequest, {self as rpc},
 };
 use ::rpc::forge_api_client::ForgeApiClient;
 use ::rpc::{Machine, NetworkSegment};

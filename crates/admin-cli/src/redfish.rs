@@ -1,0 +1,1401 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+pub use args::{Cmd, RedfishAction, UriInfo};
+pub use cmds::{action, handle_browse_command};
+use libredfish::model::update_service::ComponentType;
+
+pub mod args {
+    use std::path::PathBuf;
+
+    use clap::{ArgGroup, Parser};
+
+    use super::*;
+
+    #[derive(Parser, Debug, Clone)]
+    pub struct RedfishAction {
+        #[clap(subcommand)]
+        pub command: Cmd,
+
+        #[clap(
+            long,
+            global = true,
+            help = "IP:port of machine BMC. Port is optional and defaults to 443"
+        )]
+        pub address: Option<String>,
+
+        #[clap(long, global = true, help = "Username for machine BMC")]
+        pub username: Option<String>,
+
+        #[clap(long, global = true, help = "Password for machine BMC")]
+        pub password: Option<String>,
+    }
+
+    #[derive(Parser, Debug, PartialEq, Clone)]
+    #[clap(rename_all = "kebab_case")]
+    pub enum Cmd {
+        /// List BIOS attributes
+        BiosAttrs,
+        /// Set hard drive first in boot order
+        BootHdd,
+        /// Set PXE first in boot order
+        BootPxe,
+        /// Set Boot order to UEFI Http First
+        BootUefiHttp,
+        /// On next boot only, boot from hard drive
+        BootOnceHdd,
+        /// On next boot only, boot from PXE
+        BootOncePxe,
+        /// Boot rom UEFI HTTP Once
+        BootOnceUefiHttp,
+        /// Delete all pending jobs
+        ClearPending,
+        /// Create new BMC user
+        CreateBmcUser(BmcUser),
+        /// Create new BMC user
+        DeleteBmcUser(DeleteBmcUser),
+        /// Setup host for use
+        MachineSetup(MachineSetupArgs),
+        /// Is everything MachineSetup does already done? What's missing?
+        MachineSetupStatus(MachineSetupStatusArgs),
+        /// Set our password policy
+        SetForgePasswordPolicy,
+        /// List one or all BIOS boot options
+        GetBootOption(BootOptionSelector),
+        /// Is this thing on?
+        GetPowerState,
+        /// Disable BMC/BIOS lockdown
+        LockdownDisable,
+        /// Enable BMC/BIOS lockdown
+        LockdownEnable,
+        /// Display status of BMC/BIOS lockdown
+        LockdownStatus,
+        /// Force turn machine off
+        #[clap(alias = "off", verbatim_doc_comment)]
+        ForceOff,
+        /// Force restart. This is equivalent to pressing the reset button on the front panel.
+        /// - Will not restart DPUs
+        /// - Will apply pending BIOS/UEFI setting changes
+        #[clap(alias = "reset", verbatim_doc_comment)]
+        ForceRestart,
+        /// Graceful restart. Asks the OS to restart via ACPI
+        /// - Might restart DPUs if no OS is running
+        /// - Will not apply pending BIOS/UEFI setting changes
+        #[clap(alias = "restart", verbatim_doc_comment)]
+        GracefulRestart,
+        /// Graceful host shutdown
+        #[clap(alias = "shutdown", verbatim_doc_comment)]
+        GracefulShutdown,
+        /// AC power cycle
+        ACPowerCycle,
+        /// Power on a machine
+        On,
+        /// List PCIe devices
+        PcieDevices,
+        /// List Direct Attached drives
+        LocalStorage,
+        /// List pending operations
+        Pending,
+        /// Display power metrics (voltages, power supplies, etc)
+        PowerMetrics,
+        /// Enable serial console
+        SerialEnable,
+        /// Serial console status
+        SerialStatus,
+        /// Display thermal metrics (fans and temperatures)
+        ThermalMetrics,
+        /// Clear Trusted Platform Module (TPM)
+        TpmReset,
+        /// Reset BMC to factory defaults
+        BmcResetToDefaults,
+        /// Reboot the BMC itself
+        BmcReset,
+        /// Get Secure boot status
+        GetSecureBoot,
+        /// Disable Secure Boot
+        DisableSecureBoot,
+        /// List Chassis
+        GetChassisAll,
+        // List Chassis Subsystem
+        GetChassis(Chassis),
+        /// Show BMC's Ethernet interface information
+        GetBmcEthernetInterfaces,
+        /// Show System Ethernet interface information
+        GetSystemEthernetInterfaces,
+        /// List of existing BMC accounts
+        GetBmcAccounts,
+        /// Rename an account
+        ChangeBmcUsername(BmcUsername),
+        /// Change password for a BMC user
+        ChangeBmcPassword(BmcPassword),
+        /// Change UEFI password
+        ChangeUefiPassword(UefiPassword),
+        #[clap(about = "DPU specific operations", subcommand)]
+        Dpu(DpuOperations),
+        GetManager,
+        /// Update host firmware
+        UpdateFirmwareMultipart(Multipart),
+        // Get detailed info on a Redfish task
+        GetTask(Task),
+        // Get a list of Redfish tasks
+        GetTasks,
+        /// Clear UEFI password
+        ClearUefiPassword(UefiPassword),
+        // Is IPMI enabled over LAN
+        IsIpmiOverLanEnabled,
+        // Enable IPMI over LAN
+        EnableIpmiOverLan,
+        // Disable IPMI over LAN
+        DisableIpmiOverLan,
+        // Get Base Mac Address (DPU only)
+        GetBaseMacAddress,
+        // Clear Nvram (Viking only)
+        ClearNvram,
+        // Redfish browser
+        Browse(UriInfo),
+        // Set BIOS options
+        SetBios(SetBios),
+        GetNicMode,
+        IsInfiniteBootEnabled,
+        EnableInfiniteBoot,
+        SetNicMode,
+        SetDpuMode,
+        ChassisResetCard1Powercycle,
+        SetBootOrderDpuFirst(SetBootOrderDpuFirstArgs),
+        GetHostRshim,
+        EnableHostRshim,
+        DisableHostRshim,
+        GetBossController,
+        DecomissionController(DecomissionControllerArgs),
+        CreateVolume(CreateVolumeArgs),
+        IsBootOrderSetup(SetBootOrderDpuFirstArgs),
+    }
+
+    #[derive(Parser, Debug, PartialEq, Clone)]
+    pub struct UriInfo {
+        #[clap(long, help = "Redfish URI")]
+        pub uri: String,
+    }
+
+    #[derive(Parser, Debug, PartialEq, Clone)]
+    #[clap(group(ArgGroup::new("selector").required(true).args(&["all", "id"])))]
+    pub struct BootOptionSelector {
+        #[clap(long)]
+        pub all: bool,
+        #[clap(long)]
+        pub id: Option<String>,
+    }
+
+    #[derive(clap::Parser, Debug, PartialEq, Clone)]
+    pub enum DpuOperations {
+        /// BMC's FW Commands
+        #[clap(visible_alias = "fw", about = "BMC's FW Commands", subcommand)]
+        Firmware(FwCommand),
+        /// Show ports information
+        Ports(ShowPort),
+    }
+
+    #[derive(Parser, Debug, PartialEq, Clone)]
+    pub enum FwCommand {
+        /// Print FW update status
+        Status,
+        /// Update BMC's FW to the given FW package
+        Update(FwPackage),
+        /// Show FW versions of different components
+        Show(ShowFw),
+    }
+
+    #[derive(Parser, Debug, PartialEq, Clone)]
+    pub struct FwPackage {
+        #[clap(short, long, help = "FW package to install")]
+        pub package: PathBuf,
+    }
+
+    #[derive(Parser, Debug, PartialEq, Clone)]
+    pub struct UefiPassword {
+        #[clap(long, help = "Current UEFI password")]
+        pub current_password: String,
+        #[clap(long, help = "New UEFI password")]
+        pub new_password: String,
+    }
+
+    #[derive(Parser, Debug, PartialEq, Clone)]
+    pub struct BmcUsername {
+        #[clap(long, help = "Old username")]
+        pub old_user: String,
+        #[clap(long, help = "New username")]
+        pub new_user: String,
+    }
+
+    #[derive(Parser, Debug, PartialEq, Clone)]
+    pub struct BmcPassword {
+        #[clap(long, help = "New BMC password")]
+        pub new_password: String,
+        #[clap(long, help = "BMC user")]
+        pub user: String,
+    }
+
+    #[derive(Parser, Debug, PartialEq, Clone)]
+    pub struct Multipart {
+        #[clap(long, help = "Local filename for the firmware to be installed")]
+        pub filename: String,
+        #[clap(
+            long,
+            help = "Firmware type, ignored by some platforms and optional on others"
+        )]
+        pub component_type: Option<ComponentType>,
+    }
+
+    #[derive(Parser, Debug, PartialEq, Clone)]
+    pub struct Task {
+        #[clap(long, help = "Task ID")]
+        pub taskid: String,
+    }
+
+    #[derive(Parser, Debug, PartialEq, Clone)]
+    pub struct Chassis {
+        #[clap(long, help = "Chassis ID")]
+        pub chassis_id: String,
+    }
+
+    #[derive(Parser, Debug, PartialEq, Clone)]
+    pub struct BmcUser {
+        #[clap(long, help = "BMC password")]
+        pub new_password: String,
+        #[clap(long, help = "BMC user")]
+        pub user: String,
+        #[clap(
+            long,
+            help = "BMC role (administrator, operator, readonly, noaccess). Default to administrator"
+        )]
+        pub role_id: Option<String>,
+    }
+
+    #[derive(Parser, Debug, PartialEq, Clone)]
+    pub struct DeleteBmcUser {
+        #[clap(long, help = "BMC user")]
+        pub user: String,
+    }
+
+    #[derive(Parser, Debug, PartialEq, Clone)]
+    pub struct MachineSetupArgs {
+        #[clap(long, help = "boot_interface_mac")]
+        pub boot_interface_mac: Option<String>,
+        #[clap(long, help = "BIOS profile config in JSON format")]
+        pub bios_profiles: Option<String>,
+        #[clap(long, help = "BIOS profile to use")]
+        pub selected_profile: Option<libredfish::BiosProfileType>,
+    }
+
+    #[derive(Parser, Debug, PartialEq, Clone)]
+    pub struct MachineSetupStatusArgs {
+        #[clap(long, help = "boot_interface_mac")]
+        pub boot_interface_mac: Option<String>,
+    }
+
+    #[derive(Parser, Debug, PartialEq, Clone)]
+    pub struct SetBootOrderDpuFirstArgs {
+        #[clap(long, help = "boot_interface_mac")]
+        pub boot_interface_mac: String,
+    }
+
+    #[derive(Parser, Debug, PartialEq, Clone)]
+    pub struct DecomissionControllerArgs {
+        #[clap(long, help = "controller_id")]
+        pub controller_id: String,
+    }
+
+    #[derive(Parser, Debug, PartialEq, Clone)]
+    pub struct CreateVolumeArgs {
+        #[clap(long, help = "controller_id")]
+        pub controller_id: String,
+        #[clap(long, help = "volume_name")]
+        pub volume_name: String,
+    }
+
+    #[derive(Parser, Debug, PartialEq, Clone)]
+    #[clap(group(
+            ArgGroup::new("show_fw")
+            .required(true)
+            .args(&["all", "bmc", "dpu_os", "uefi", "fw"])))]
+    pub struct ShowFw {
+        #[clap(
+            short,
+            long,
+            action,
+            conflicts_with = "fw",
+            help = "Show all discovered firmware key/values"
+        )]
+        pub all: bool,
+
+        #[clap(long, action, conflicts_with = "fw", help = "Show BMC FW Version")]
+        pub bmc: bool,
+
+        #[clap(
+            long,
+            action,
+            conflicts_with = "fw",
+            help = "Show DPU OS version (shortcut for `show DPU_OS`)"
+        )]
+        pub dpu_os: bool,
+
+        #[clap(
+            long,
+            action,
+            conflicts_with = "fw",
+            help = "Show UEFI version (shortcut for `show DPU_UEFI`)"
+        )]
+        pub uefi: bool,
+
+        #[clap(
+            default_value(""),
+            help = "The firmware type to query (e.g. DPU_OS, DPU_UEFI, DPU_NIC), leave empty for all (default)"
+        )]
+        pub fw: String,
+    }
+
+    #[derive(Parser, Debug, PartialEq, Clone)]
+    pub struct ShowPort {
+        #[clap(
+            short,
+            long,
+            action,
+            conflicts_with = "port",
+            help = "Show all ports (DEPRECATED)"
+        )]
+        pub all: bool,
+
+        #[clap(
+            default_value(""),
+            help = "The port to query (e.g. eth0, eth1), leave empty for all (default)"
+        )]
+        pub port: String,
+    }
+
+    #[derive(Parser, Debug, Clone, PartialEq)]
+    pub struct SetBios {
+        #[clap(
+            long,
+            help = "BIOS attributes to set in JSON, ex: {\"OperatingModes_ChooseOperatingMode\": \"MaximumPerformance\"}"
+        )]
+        pub attributes: String,
+    }
+}
+
+pub mod cmds {
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::str::FromStr;
+    use std::time::Duration;
+
+    use color_eyre::eyre::eyre;
+    use libredfish::model::oem::nvidia_dpu::NicMode;
+    use libredfish::model::software_inventory::SoftwareInventory;
+    use libredfish::model::task::{Task, TaskState};
+    use libredfish::model::{LinkStatus, ResourceStatus};
+    use libredfish::{
+        Boot, Chassis, EnabledDisabled, EthernetInterface, NetworkDeviceFunction, NetworkPort,
+        Redfish, RedfishError, RoleId, SystemPowerControl,
+    };
+    use mac_address::MacAddress;
+    use prettytable::{Table, row};
+    use serde::Serialize;
+    use tracing::warn;
+
+    use super::args::{Cmd, DpuOperations, FwCommand, RedfishAction, ShowFw, ShowPort};
+    use super::*;
+    use crate::rpc::ApiClient;
+
+    pub async fn handle_browse_command(
+        api_client: &ApiClient,
+        uri: &str,
+    ) -> color_eyre::Result<()> {
+        let data = api_client.0.redfish_browse(uri.to_string()).await?;
+        #[derive(Serialize, Debug)]
+        struct Output {
+            text: serde_json::Value,
+            headers: HashMap<String, String>,
+        }
+
+        let text = match serde_json::from_str(&data.text) {
+            Ok(text) => text,
+            Err(_) => {
+                println!("{data:?}");
+                return Ok(());
+            }
+        };
+
+        let output = Output {
+            text,
+            headers: data.headers,
+        };
+        println!("{}", serde_json::to_string_pretty(&output).unwrap());
+
+        Ok(())
+    }
+
+    pub async fn action(action: RedfishAction) -> color_eyre::Result<()> {
+        let endpoint = libredfish::Endpoint {
+            host: match action.address {
+                Some(a) => a,
+                None => {
+                    return Err(eyre!("Missing --address"));
+                }
+            },
+            user: action.username,
+            password: action.password,
+            ..Default::default()
+        };
+
+        let proxy = std::env::var("http_proxy")
+            .ok()
+            .or_else(|| std::env::var("https_proxy").ok())
+            .or_else(|| std::env::var("HTTP_PROXY").ok())
+            .or_else(|| std::env::var("HTTPS_PROXY").ok());
+
+        use Cmd::*;
+        let pool = libredfish::RedfishClientPool::builder()
+            .proxy(proxy)
+            .build()?;
+        let redfish: Box<dyn Redfish> = match &action.command {
+            ChangeBmcPassword(_) => pool.create_standard_client(endpoint)?,
+            _ => pool.create_client(endpoint).await?,
+        };
+        match action.command {
+            BiosAttrs => {
+                let bios = redfish.bios().await?;
+                println!("{}", serde_json::to_string(&bios).unwrap());
+            }
+            BootHdd => {
+                redfish.boot_first(Boot::HardDisk).await?;
+            }
+            BootPxe => {
+                redfish.boot_first(Boot::Pxe).await?;
+            }
+            BootUefiHttp => {
+                redfish.boot_first(Boot::UefiHttp).await?;
+            }
+            BootOnceHdd => {
+                redfish.boot_once(Boot::HardDisk).await?;
+            }
+            BootOncePxe => {
+                redfish.boot_once(Boot::Pxe).await?;
+            }
+            BootOnceUefiHttp => {
+                redfish.boot_once(Boot::UefiHttp).await?;
+            }
+            ClearPending => {
+                redfish.clear_pending().await?;
+            }
+            MachineSetup(machine_setup_args) => {
+                let bios_profiles = if let Some(profiles_string) = machine_setup_args.bios_profiles
+                {
+                    let parsed: libredfish::BiosProfileVendor =
+                        serde_json::from_str(profiles_string.as_str())?;
+                    parsed
+                } else {
+                    HashMap::default()
+                };
+                let selected_profile = machine_setup_args
+                    .selected_profile
+                    .unwrap_or(libredfish::BiosProfileType::Performance);
+
+                redfish
+                    .machine_setup(
+                        machine_setup_args.boot_interface_mac.as_deref(),
+                        &bios_profiles,
+                        selected_profile,
+                    )
+                    .await?;
+            }
+            MachineSetupStatus(machine_setup_status_args) => {
+                println!(
+                    "{}",
+                    redfish
+                        .machine_setup_status(
+                            machine_setup_status_args.boot_interface_mac.as_deref()
+                        )
+                        .await?
+                );
+            }
+            SetForgePasswordPolicy => {
+                redfish.set_machine_password_policy().await?;
+            }
+            GetPowerState => {
+                println!("{}", redfish.get_power_state().await?);
+            }
+            GetBootOption(selector) => {
+                if let Some(boot_id) = selector.id {
+                    println!("{:?}", redfish.get_boot_option(&boot_id).await?)
+                } else {
+                    let all = redfish.get_boot_options().await?;
+                    for b in all.members {
+                        let id = b.odata_id.split('/').next_back().unwrap();
+                        println!("{:?}", redfish.get_boot_option(id).await?)
+                    }
+                }
+            }
+            LockdownDisable => {
+                redfish.lockdown(EnabledDisabled::Disabled).await?;
+                println!("BIOS settings changes require system restart");
+            }
+            LockdownEnable => {
+                redfish.lockdown(EnabledDisabled::Enabled).await?;
+                println!("BIOS settings changes require system restart");
+            }
+            LockdownStatus => {
+                println!("{}", redfish.lockdown_status().await?);
+            }
+            ForceOff => {
+                redfish.power(SystemPowerControl::ForceOff).await?;
+            }
+            On => {
+                redfish.power(SystemPowerControl::On).await?;
+            }
+            PcieDevices => {
+                let mut table = Table::new();
+                table.set_titles(row![
+                    "ID",
+                    "Manufacturer",
+                    "Name",
+                    "Firmware version",
+                    "Part",
+                    "Serial",
+                    "Status",
+                ]);
+                for dev in redfish.pcie_devices().await? {
+                    let status = dev.status.unwrap();
+                    table.add_row(row![
+                        dev.id.unwrap_or_default(),
+                        dev.manufacturer.or(dev.gpu_vendor).unwrap_or_default(),
+                        dev.name.unwrap_or_default(),
+                        dev.firmware_version.unwrap_or_default(),
+                        dev.part_number.unwrap_or_default(),
+                        dev.serial_number.unwrap_or_default(),
+                        format!(
+                            "{} {}",
+                            status.health.unwrap_or_default(),
+                            status.state.unwrap_or("".to_string())
+                        ),
+                    ]);
+                }
+                table.set_format(*prettytable::format::consts::FORMAT_NO_LINESEP_WITH_TITLE);
+                table.printstd();
+            }
+            LocalStorage => {
+                let mut table = Table::new();
+                table.set_titles(row![
+                    "ID",
+                    "Manufacturer",
+                    "Name",
+                    "model",
+                    "capacity(GiB)",
+                    "revision",
+                    "Serial",
+                    "PredictFail",
+                    "PredictLife",
+                    "Status",
+                ]);
+                for dev in redfish.get_drives_metrics().await? {
+                    let status = dev.status.unwrap_or(ResourceStatus {
+                        health: Some(libredfish::model::ResourceHealth::Ok),
+                        health_rollup: Some(libredfish::model::ResourceHealth::Ok),
+                        state: Some(libredfish::model::ResourceState::Unknown),
+                    });
+                    let mut predictlife = 100;
+                    if let Some(ref _pred_fail) = dev.failure_predicted
+                        && *_pred_fail
+                    {
+                        predictlife = 1;
+                    }
+                    if dev.predicted_media_life_left_percent.is_none() {
+                        // supermicro has percentage_drive_life_used in oem...
+                        if let Some(oem) = dev.oem
+                            && let Some(supermicro) = oem.supermicro
+                        {
+                            predictlife =
+                                100 - (supermicro.percentage_drive_life_used.unwrap_or(0.0) as i32);
+                        }
+                    }
+                    table.add_row(row![
+                        dev.id.unwrap_or("".to_string()),
+                        dev.manufacturer.unwrap_or("".to_string()),
+                        dev.name.unwrap_or("".to_string()),
+                        dev.model.unwrap_or("".to_string()),
+                        dev.capacity_bytes.unwrap_or(0) / 1024 / 1024 / 1024,
+                        dev.revision.unwrap_or("".to_string()),
+                        dev.serial_number.unwrap_or("".to_string()),
+                        dev.failure_predicted.unwrap_or(true),
+                        predictlife,
+                        format!(
+                            "{} {}",
+                            status.health.unwrap_or_default(),
+                            status
+                                .state
+                                .unwrap_or(libredfish::model::ResourceState::Unknown)
+                        ),
+                    ]);
+                }
+                table.set_format(*prettytable::format::consts::FORMAT_NO_LINESEP_WITH_TITLE);
+                table.printstd();
+            }
+            Pending => {
+                let pending = redfish.pending().await?;
+                println!("{pending:#?}");
+            }
+            PowerMetrics => {
+                println!("{:?}", redfish.get_power_metrics().await?);
+            }
+            ForceRestart => {
+                redfish.power(SystemPowerControl::ForceRestart).await?;
+            }
+            GracefulRestart => {
+                redfish.power(SystemPowerControl::GracefulRestart).await?;
+            }
+            SerialEnable => {
+                redfish.setup_serial_console().await?;
+                println!("BIOS settings changes require system restart");
+            }
+            SerialStatus => {
+                println!("{}", redfish.serial_console_status().await?);
+            }
+            GracefulShutdown => {
+                redfish.power(SystemPowerControl::GracefulShutdown).await?;
+            }
+            ACPowerCycle => {
+                redfish.power(SystemPowerControl::ACPowercycle).await?;
+            }
+            ThermalMetrics => {
+                println!("{:?}", redfish.get_thermal_metrics().await?);
+            }
+            TpmReset => {
+                redfish.clear_tpm().await?;
+                println!("BIOS settings changes require system restart");
+            }
+            BmcResetToDefaults => {
+                redfish.bmc_reset_to_defaults().await?;
+            }
+            BmcReset => {
+                redfish.bmc_reset().await?;
+            }
+            DisableSecureBoot => {
+                redfish.disable_secure_boot().await?;
+                println!("BIOS settings changes require system restart");
+            }
+            GetSecureBoot => {
+                println!("{:#?}", redfish.get_secure_boot().await?);
+            }
+            GetBmcAccounts => {
+                for u in redfish.get_accounts().await? {
+                    println!("{u:?}");
+                }
+            }
+            CreateBmcUser(bmc_user) => {
+                let role: RoleId = match bmc_user
+                    .role_id
+                    .unwrap_or("Administrator".to_string())
+                    .to_lowercase()
+                    .as_str()
+                {
+                    "administrator" => RoleId::Administrator,
+                    "operator" => RoleId::Operator,
+                    "readonly" => RoleId::ReadOnly,
+                    "noaccess" => RoleId::NoAccess,
+                    _ => RoleId::Administrator,
+                };
+                redfish
+                    .create_user(&bmc_user.user, &bmc_user.new_password, role)
+                    .await?;
+            }
+            DeleteBmcUser(bmc_username) => {
+                redfish.delete_user(&bmc_username.user).await?;
+            }
+            ChangeBmcUsername(bmc_username) => {
+                redfish
+                    .change_username(&bmc_username.old_user, &bmc_username.new_user)
+                    .await?;
+                println!(
+                    "User {} renamed to {}",
+                    bmc_username.old_user, bmc_username.new_user
+                );
+            }
+            ChangeBmcPassword(bmc_password) => {
+                redfish
+                    .change_password(&bmc_password.user, &bmc_password.new_password)
+                    .await?;
+                println!("BIOS settings changes require system restart");
+            }
+            ChangeUefiPassword(uefi_password) => {
+                redfish
+                    .change_uefi_password(
+                        &uefi_password.current_password,
+                        &uefi_password.new_password,
+                    )
+                    .await?;
+                println!("BIOS settings changes require system restart");
+            }
+            Dpu(dpu) => match dpu {
+                DpuOperations::Firmware(fw) => match fw {
+                    FwCommand::Status => {
+                        handle_fw_status(redfish).await?;
+                    }
+                    FwCommand::Update(fw_package) => {
+                        let file_result = tokio::fs::File::open(fw_package.package).await;
+                        if let Ok(file) = file_result {
+                            redfish.update_firmware(file).await?;
+                            println!("Track update progress using firmware status");
+                        } else if let Err(err) = file_result {
+                            eprintln!("Error opening file: {err}");
+                        }
+                    }
+                    FwCommand::Show(fw) => {
+                        handle_fw_show(redfish, fw).await?;
+                    }
+                },
+                DpuOperations::Ports(ports) => {
+                    handle_port_show(redfish, ports).await?;
+                }
+            },
+            GetChassisAll => {
+                handle_get_chassis_all(redfish).await?;
+            }
+            GetChassis(chassis) => {
+                handle_get_chassis(redfish, chassis.chassis_id).await?;
+            }
+            GetBmcEthernetInterfaces => {
+                handle_ethernet_interface_show(redfish, false).await?;
+            }
+            GetSystemEthernetInterfaces => {
+                handle_ethernet_interface_show(redfish, true).await?;
+            }
+            GetManager => {
+                let manager = redfish.get_manager().await?;
+                println!("{manager:#?}");
+            }
+            UpdateFirmwareMultipart(details) => {
+                let component_type = match details.component_type {
+                    Some(x) => x,
+                    None => ComponentType::Unknown,
+                };
+                let taskid = redfish
+                    .update_firmware_multipart(
+                        Path::new(&details.filename),
+                        true,
+                        Duration::from_secs(120),
+                        component_type,
+                    )
+                    .await?;
+                loop {
+                    let task = redfish.get_task(&taskid).await?;
+                    match &task.task_state {
+                        None => {
+                            println!("No task state");
+                            return Ok(());
+                        }
+                        Some(task_state) => match task_state {
+                            TaskState::New => {
+                                println!("Task has not yet started: {task:?}");
+                            }
+                            TaskState::Starting => {
+                                println!("Task is starting: {task:?}");
+                            }
+                            TaskState::Pending => {
+                                println!("Task is starting: {task:?}");
+                            }
+                            TaskState::Running => {
+                                println!("Task is running: {task:?}");
+                            }
+                            TaskState::Completed => {
+                                println!("Task is complete: {task:?}");
+                                return Ok(());
+                            }
+                            _ => {
+                                println!("Bad task state: {task:?}");
+                                return Ok(());
+                            }
+                        },
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                }
+            }
+            GetTasks => {
+                let tasks = redfish.get_tasks().await?;
+                let mut table = Table::new();
+                table.add_row(row!["id"]);
+                for task in &tasks {
+                    table.add_row(row![task]);
+                }
+                table.printstd();
+            }
+            GetTask(details) => {
+                let task = redfish.get_task(&details.taskid).await?;
+                println!("Task info: {task:?}");
+            }
+            ClearUefiPassword(uefi_password) => {
+                let job = redfish
+                    .clear_uefi_password(&uefi_password.current_password)
+                    .await?;
+                println!("Clear UEFI password Job ID: {:?}", job.unwrap_or_default());
+            }
+            IsIpmiOverLanEnabled => {
+                let status = redfish.is_ipmi_over_lan_enabled().await?;
+                println!("IPMI enabled over LAN: {status}");
+            }
+            EnableIpmiOverLan => {
+                redfish
+                    .enable_ipmi_over_lan(EnabledDisabled::Enabled)
+                    .await?;
+            }
+            DisableIpmiOverLan => {
+                redfish
+                    .enable_ipmi_over_lan(EnabledDisabled::Disabled)
+                    .await?;
+            }
+            GetBaseMacAddress => {
+                let mut base_mac = redfish.get_base_mac_address().await?.unwrap_or_default();
+                base_mac = base_mac.replace('"', "");
+                println!("Raw Mac Address: {base_mac}, length: {}", base_mac.len());
+                base_mac.insert(10, ':');
+                base_mac.insert(8, ':');
+                base_mac.insert(6, ':');
+                base_mac.insert(4, ':');
+                base_mac.insert(2, ':');
+                match MacAddress::from_str(base_mac.as_str()) {
+                    Ok(mac) => {
+                        println!("Parsed Base Mac Address: {mac}");
+                    }
+                    Err(e) => {
+                        println!("failed to parse mac address from {base_mac}: {e}");
+                    }
+                }
+            }
+            ClearNvram => {
+                redfish.clear_nvram().await?;
+            }
+            Browse(_) => {
+                unreachable!();
+            }
+            SetBios(set_bios) => {
+                let attrmap: HashMap<String, serde_json::Value> =
+                    serde_json::from_str(set_bios.attributes.as_str()).unwrap();
+                redfish.set_bios(attrmap).await?;
+                println!("success");
+            }
+            GetNicMode => {
+                let is_dpu_in_nic_mode = redfish.get_nic_mode().await?;
+                println!("{is_dpu_in_nic_mode:#?}");
+            }
+            IsInfiniteBootEnabled => {
+                let is_infinite_boot_enabled = redfish.is_infinite_boot_enabled().await?;
+                match is_infinite_boot_enabled {
+                    Some(true) => println!("Enabled"),
+                    Some(false) => println!("Disabled"),
+                    None => println!("Unknown"),
+                }
+            }
+            EnableInfiniteBoot => {
+                redfish.enable_infinite_boot().await?;
+                println!("BIOS changes require a system restart to take effect.");
+            }
+            SetNicMode => {
+                redfish.set_nic_mode(NicMode::Nic).await?;
+            }
+            SetDpuMode => {
+                redfish.set_nic_mode(NicMode::Dpu).await?;
+            }
+            ChassisResetCard1Powercycle => {
+                redfish
+                    .chassis_reset("Card1", SystemPowerControl::PowerCycle)
+                    .await?;
+            }
+            SetBootOrderDpuFirst(args) => {
+                if let Some(job_id) = redfish
+                    .set_boot_order_dpu_first(&args.boot_interface_mac)
+                    .await?
+                {
+                    tracing::info!(
+                        "succesfully configured BIOS job {job_id} to set {} first in the server's boot order",
+                        args.boot_interface_mac
+                    )
+                } else {
+                    tracing::info!(
+                        "succesfully set {} first in the server's boot order",
+                        args.boot_interface_mac
+                    )
+                }
+            }
+            GetHostRshim => {
+                if let Some(enabled_value) = redfish.get_host_rshim().await? {
+                    tracing::info!("Host RSHIM is {}", enabled_value);
+                } else {
+                    tracing::info!("Host RSHIM is None");
+                }
+            }
+            EnableHostRshim => {
+                redfish.set_host_rshim(EnabledDisabled::Enabled).await?;
+            }
+            DisableHostRshim => {
+                redfish.set_host_rshim(EnabledDisabled::Disabled).await?;
+            }
+            GetBossController => {
+                if let Some(controller_id) = redfish.get_boss_controller().await? {
+                    tracing::info!("BOSS Controller ID: {}", controller_id);
+                } else {
+                    tracing::info!("Did not find BOSS Controller");
+                }
+            }
+            DecomissionController(args) => {
+                if let Some(jid) = redfish
+                    .decommission_storage_controller(&args.controller_id)
+                    .await?
+                {
+                    tracing::info!("JID: {}", jid);
+                } else {
+                    tracing::info!("No JID");
+                }
+            }
+            CreateVolume(args) => {
+                if let Some(jid) = redfish
+                    .create_storage_volume(&args.controller_id, &args.volume_name)
+                    .await?
+                {
+                    tracing::info!("JID: {}", jid);
+                } else {
+                    tracing::info!("No JID");
+                }
+            }
+            IsBootOrderSetup(args) => {
+                let setup = redfish
+                    .is_boot_order_setup(&args.boot_interface_mac)
+                    .await?;
+                tracing::info!(setup);
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn handle_fw_status(redfish: Box<dyn Redfish>) -> Result<(), RedfishError> {
+        let tasks: Vec<String> = redfish.get_tasks().await?;
+        let mut tasks_info: Vec<Task> = Vec::new();
+        for task in tasks.iter() {
+            if let Ok(t) = redfish.get_task(task).await {
+                tasks_info.push(t);
+            } else {
+                println!("Task {task} not found.");
+            }
+        }
+        convert_tasks_to_nice_table(tasks_info).printstd();
+        Ok(())
+    }
+
+    pub async fn handle_fw_show(
+        redfish: Box<dyn Redfish>,
+        args: ShowFw,
+    ) -> Result<(), RedfishError> {
+        if args.all || args.bmc || args.dpu_os || args.uefi || args.fw.is_empty() {
+            let f = FwFilter {
+                only_bmc: args.bmc,
+                only_dpu_os: args.dpu_os,
+                only_uefi: args.uefi,
+            };
+            match show_all_fws(redfish, f).await {
+                Ok(_) => {
+                    // TODO(chet): Remove this ~March 2024.
+                    // Use tracing::warn for this so its both a little more
+                    // noticeable, and a little more annoying/naggy. If people
+                    // complain, it means its working.
+                    if args.all {
+                        warn!(
+                            "redundant `--all` with basic `show` is deprecated. just do `fw show`"
+                        )
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("Error displaying firmware information: {e}");
+                    Err(e)
+                }
+            }
+        } else {
+            match redfish.get_firmware(&args.fw).await {
+                Ok(firmware) => {
+                    convert_fws_to_nice_table(vec![firmware]).printstd();
+                    Ok(())
+                }
+                Err(err) => {
+                    eprintln!("Error fetching firmware '{}'", args.fw);
+                    Err(err)
+                }
+            }
+        }
+    }
+
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct FwFilter {
+        only_bmc: bool,
+        only_dpu_os: bool,
+        only_uefi: bool,
+    }
+
+    async fn show_all_fws(redfish: Box<dyn Redfish>, f: FwFilter) -> Result<(), RedfishError> {
+        let fws: Vec<String> = redfish.get_software_inventories().await?;
+        let mut fws_info: Vec<SoftwareInventory> = Vec::new();
+
+        for fw in fws.iter() {
+            if let Ok(firmware) = redfish.get_firmware(fw).await {
+                fws_info.push(firmware);
+            } else {
+                println!("Firmware {fw} not found.");
+            }
+        }
+
+        if f.only_bmc {
+            if !fws.contains(&"BMC_Firmware".to_string()) {
+                println!("BMC FW is not found");
+                return Err(RedfishError::NoContent);
+            }
+            fws_info.retain(|f| f.id.contains("BMC_Firmware"));
+        }
+
+        if f.only_dpu_os {
+            if !fws.contains(&"DPU_OS".to_string()) {
+                println!("DPU OS is not found");
+                return Err(RedfishError::NoContent);
+            }
+            fws_info.retain(|f| f.id == *"DPU_OS");
+        }
+
+        if f.only_uefi {
+            if !fws.contains(&"DPU_UEFI".to_string()) {
+                println!("DPU UEFI is not found");
+                return Err(RedfishError::NoContent);
+            }
+            fws_info.retain(|f| f.id == *"DPU_UEFI");
+        }
+
+        convert_fws_to_nice_table(fws_info).printstd();
+        Ok(())
+    }
+
+    fn convert_fws_to_nice_table(fws: Vec<SoftwareInventory>) -> Box<Table> {
+        let mut table = Table::new();
+        table.add_row(row!["Id", "Version"]);
+        for fw in fws {
+            table.add_row(row![fw.id, fw.version.unwrap_or("(NULL)".to_string())]);
+        }
+        table.into()
+    }
+
+    fn convert_tasks_to_nice_table(tasks: Vec<Task>) -> Box<Table> {
+        let mut table = Table::new();
+        table.add_row(row![
+            "Id",
+            "State",
+            "Status",
+            "Percentage Completed (%)",
+            "Messages"
+        ]);
+        for mut task in tasks {
+            table.add_row(row![
+                task.id,
+                task.task_state
+                    .unwrap_or(libredfish::model::task::TaskState::Exception)
+                    .to_string(),
+                task.task_status.unwrap_or("None".to_string()),
+                task.percent_complete.unwrap_or(0),
+                task.messages
+                    .pop()
+                    .map(|last_message| last_message.message)
+                    .unwrap_or("No Message".to_string())
+            ]);
+        }
+        table.into()
+    }
+
+    pub async fn handle_port_show(
+        redfish: Box<dyn Redfish>,
+        args: ShowPort,
+    ) -> Result<(), RedfishError> {
+        match show_all_ports(redfish).await {
+            Ok((mut ports_info, netdev_funcs_info)) => {
+                if !args.port.is_empty() {
+                    ports_info.retain(|f| *f.id.as_ref().unwrap() == args.port);
+                }
+                convert_ports_to_nice_table(ports_info, netdev_funcs_info).printstd();
+                // TODO(chet): Remove this ~March 2024.
+                // Use tracing::warn for this so its both a little more
+                // noticeable, and a little more annoying/naggy. If people
+                // complain, it means its working.
+                if args.all {
+                    warn!("redundant `--all` with basic `show` is deprecated. just do `port show`")
+                }
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn get_bluefield_chassis(redfish: &dyn Redfish) -> Result<String, RedfishError> {
+        let chassis_vec: Vec<String> = redfish.get_chassis_all().await?;
+        if let Some(bluefield_bmc) = chassis_vec
+            .iter()
+            .find(|&chassis| chassis.contains("Bluefield"))
+        {
+            Ok(bluefield_bmc.to_string())
+        } else {
+            eprintln!("Bluefield chassis was not found");
+            Err(RedfishError::NoContent)
+        }
+    }
+
+    async fn show_all_ports(
+        redfish: Box<dyn Redfish>,
+    ) -> Result<(Vec<NetworkPort>, Vec<NetworkDeviceFunction>), RedfishError> {
+        let chassis_id = get_bluefield_chassis(&*redfish).await?;
+        let ports: Vec<String> = redfish
+            .get_ports(&chassis_id, "NvidiaNetworkAdapter")
+            .await?;
+        let mut ports_info: Vec<NetworkPort> = Vec::new();
+
+        for p in ports.iter() {
+            match redfish
+                .get_port(&chassis_id, "NvidiaNetworkAdapter", p)
+                .await
+            {
+                Ok(port) => {
+                    ports_info.push(port);
+                }
+                Err(err) => {
+                    eprintln!("Error fetching port {p}: {err}");
+                }
+            }
+        }
+
+        let netdev_funcs: Vec<String> = redfish.get_network_device_functions(&chassis_id).await?;
+        let mut netdev_funcs_info: Vec<NetworkDeviceFunction> = Vec::new();
+
+        for n in netdev_funcs.iter() {
+            match redfish
+                .get_network_device_function(&chassis_id, n, None)
+                .await
+            {
+                Ok(netdev) => {
+                    netdev_funcs_info.push(netdev);
+                }
+                Err(err) => {
+                    eprintln!("Error fetching network device {n}: {err}");
+                }
+            }
+        }
+        Ok((ports_info, netdev_funcs_info))
+    }
+
+    fn convert_ports_to_nice_table(
+        ports: Vec<NetworkPort>,
+        netdevs: Vec<NetworkDeviceFunction>,
+    ) -> Box<Table> {
+        let mut table = Table::new();
+        table.add_row(row![
+            "Id",
+            "Link Status",
+            "Type",
+            "MAC Address",
+            "MTU Size",
+            "Speed (Gbps)"
+        ]);
+
+        for port in &ports {
+            for netdev in &netdevs {
+                if let (Some(port_id), Some(netdev_id)) = (&port.id, &netdev.id)
+                    && netdev_id.contains(port_id)
+                {
+                    table.add_row(row![
+                        port_id,
+                        port.link_status
+                            .as_ref()
+                            .unwrap_or(&LinkStatus::NoLink)
+                            .to_string(),
+                        netdev
+                            .net_dev_func_type
+                            .as_ref()
+                            .unwrap_or(&"None".to_string()),
+                        netdev
+                            .ethernet
+                            .as_ref()
+                            .and_then(|ethernet| ethernet.mac_address.as_ref())
+                            .cloned()
+                            .unwrap_or_else(|| "None".to_string()),
+                        netdev
+                            .ethernet
+                            .as_ref()
+                            .and_then(|ethernet| ethernet.mtu_size)
+                            .unwrap_or(0),
+                        port.current_speed_gbps.unwrap_or(0),
+                    ]);
+                }
+            }
+        }
+
+        table.into()
+    }
+
+    pub async fn handle_ethernet_interface_show(
+        redfish: Box<dyn Redfish>,
+        fetch_system_interfaces: bool,
+    ) -> Result<(), RedfishError> {
+        let eth_ifs: Vec<String> = match fetch_system_interfaces {
+            false => redfish.get_manager_ethernet_interfaces().await?,
+            true => redfish.get_system_ethernet_interfaces().await?,
+        };
+        let mut eth_ifs_info: Vec<EthernetInterface> = Vec::new();
+
+        for iface_id in eth_ifs.iter() {
+            let result = match fetch_system_interfaces {
+                false => redfish.get_manager_ethernet_interface(iface_id).await,
+                true => redfish.get_system_ethernet_interface(iface_id).await,
+            };
+
+            match result {
+                Ok(iface) => {
+                    eth_ifs_info.push(iface);
+                }
+                Err(err) => {
+                    eprintln!("Error fetching ethernet interface '{iface_id}': {err}");
+                }
+            }
+        }
+        convert_ethernet_interfaces_to_nice_table(eth_ifs_info).printstd();
+        Ok(())
+    }
+
+    fn convert_ethernet_interfaces_to_nice_table(eth_ifs: Vec<EthernetInterface>) -> Box<Table> {
+        let mut table = Table::new();
+        table.add_row(row![
+            "Id",
+            "Link Status",
+            "MAC Address",
+            "IP Addresses",
+            "Static IP Addresses",
+            "MTU Size",
+            "Speed (Mbps)",
+            "UefiDevicePath"
+        ]);
+
+        for eth_if in eth_ifs {
+            let mut ips = Vec::new();
+            for ip in eth_if.ipv4_addresses {
+                if let Some(ip) = ip.address {
+                    ips.push(ip);
+                }
+            }
+            for ip in eth_if.ipv6_addresses {
+                if let Some(ip) = ip.address {
+                    ips.push(ip);
+                }
+            }
+
+            let mut static_ips = Vec::new();
+            for ip in eth_if.ipv4_static_addresses {
+                if let Some(ip) = ip.address {
+                    static_ips.push(ip);
+                }
+            }
+            for ip in eth_if.ipv6_static_addresses {
+                if let Some(ip) = ip.address {
+                    static_ips.push(ip);
+                }
+            }
+
+            table.add_row(row![
+                eth_if.id.as_ref().unwrap_or(&"None".to_string()),
+                eth_if.link_status.unwrap_or(LinkStatus::NoLink).to_string(),
+                eth_if.mac_address.as_deref().unwrap_or("None"),
+                ips.join(","),
+                static_ips.join(","),
+                eth_if
+                    .mtu_size
+                    .map(|mtu| mtu.to_string())
+                    .as_deref()
+                    .unwrap_or("N/A"),
+                eth_if
+                    .speed_mbps
+                    .map(|s| s.to_string())
+                    .as_deref()
+                    .unwrap_or("N/A"),
+                eth_if.uefi_device_path.as_deref().unwrap_or("N/A")
+            ]);
+        }
+        table.into()
+    }
+
+    pub async fn handle_get_chassis_all(redfish: Box<dyn Redfish>) -> Result<(), RedfishError> {
+        let chassis_vec: Vec<String> = redfish.get_chassis_all().await?;
+        let mut chassis_info: Vec<Chassis> = Vec::new();
+
+        for c in chassis_vec.iter() {
+            match redfish.get_chassis(c).await {
+                Ok(chassis) => {
+                    chassis_info.push(chassis);
+                }
+                Err(err) => {
+                    eprintln!("Error fetching chassis '{c}': {err}");
+                }
+            }
+        }
+        convert_chassis_to_nice_table(chassis_info).printstd();
+        Ok(())
+    }
+
+    pub async fn handle_get_chassis(
+        redfish: Box<dyn Redfish>,
+        chassis_id: String,
+    ) -> Result<(), RedfishError> {
+        let chassis_vec: Vec<String> = redfish.get_chassis_all().await?;
+        for c in chassis_vec.iter() {
+            match redfish.get_chassis(c).await {
+                Ok(chassis) => {
+                    if *c == chassis_id {
+                        println!("{chassis:?}");
+                        return Ok(());
+                    }
+                }
+                Err(err) => {
+                    eprintln!("Error fetching chassis '{c}': {err}");
+                }
+            }
+        }
+
+        println!("Could not find chassis with id {chassis_id} out of {chassis_vec:#?}");
+        Ok(())
+    }
+
+    fn convert_chassis_to_nice_table(chassis_vec: Vec<Chassis>) -> Box<Table> {
+        let mut table = Table::new();
+        table.add_row(row!["Id", "Manufacturer", "Model",]);
+
+        for chassis in &chassis_vec {
+            table.add_row(row![
+                chassis.id.as_ref().unwrap_or(&"None".to_string()),
+                chassis.manufacturer.as_ref().unwrap_or(&"None".to_string()),
+                chassis.model.as_ref().unwrap_or(&"None".to_string()),
+            ]);
+        }
+        table.into()
+    }
+}
+#[cfg(test)]
+mod tests;
