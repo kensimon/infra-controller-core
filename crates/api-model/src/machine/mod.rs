@@ -112,10 +112,18 @@ pub struct ManagedHostStateSnapshot {
 
 impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for ManagedHostStateSnapshot {
     fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
+        // Custom type to work with the fact that our query has to use `racks.health_overrides AS json`
+        #[derive(Deserialize)]
+        struct RackHealthOverrides {
+            json: HealthReportOverrides,
+        }
+
         let host_snapshot: sqlx::types::Json<MachineSnapshotPgJson> =
             row.try_get("host_snapshot")?;
         let dpu_snapshots: sqlx::types::Json<Vec<Option<MachineSnapshotPgJson>>> =
             row.try_get("dpu_snapshots")?;
+        let rack_health_overrides: sqlx::types::Json<Vec<Option<RackHealthOverrides>>> =
+            row.try_get("rack_health_overrides")?;
         // We are setting dpa_interface_snapshots to an emtpy vector here.
         // This will be filled by load_object_state later.
         let dpa_interface_snapshots: Vec<DpaInterface> = Vec::new();
@@ -138,6 +146,20 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for ManagedHostStateSnapshot {
             .map(TryInto::try_into)
             .collect::<Result<Vec<_>, _>>()?;
 
+        let rack_health_overrides = rack_health_overrides
+            .0
+            .into_iter()
+            .next()
+            .flatten()
+            .and_then(|overrides| {
+                let overrides = overrides.json;
+                if overrides.replace.is_some() || !overrides.merges.is_empty() {
+                    Some(overrides)
+                } else {
+                    None
+                }
+            });
+
         // Instance network observation is fetched from dpu_snapshots.
         if let Some(instance) = &mut instance {
             instance.observations.network =
@@ -157,10 +179,10 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for ManagedHostStateSnapshot {
             dpa_interface_snapshots,
             managed_state,
             instance,
+            rack_health_overrides,
             // This will need to be modified by callers, as its value depends on a
             // HardwareHealthReportsConfig being specified.
             aggregate_health: health_report::HealthReport::empty("".to_string()),
-            rack_health_overrides: None,
         };
 
         result.sort_dpu_snapshots()?;
