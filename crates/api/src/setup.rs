@@ -372,7 +372,7 @@ pub async fn start_api(
     // If we end up having static DPUDeployments, we could move the static CRs outside of the API.
     let dpf_sdk: Option<Arc<dyn crate::dpf::DpfOperations>> = if carbide_config.dpf.enabled {
         tracing::info!("Initializing DPF SDK");
-        let repo = carbide_dpf::KubeRepository::new()
+        let repo = carbide_dpf::KubeRepository::new(cancel_token.clone())
             .await
             .map_err(|e| eyre::eyre!("Failed to create DPF repository: {e}"))?;
 
@@ -411,6 +411,8 @@ pub async fn start_api(
         Some(Arc::new(crate::dpf::DpfSdkOps::new(
             Arc::new(sdk),
             db_pool.clone(),
+            join_set,
+            cancel_token.clone(),
         )))
     } else {
         None

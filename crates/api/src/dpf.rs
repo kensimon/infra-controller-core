@@ -17,10 +17,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use carbide_dpf::{
-    BmcPasswordProvider, DpfError, DpfSdk, DpuDeviceInfo, DpuNodeInfo, DpuPhase, DpuWatcher,
-    KubeRepository, ResourceLabeler, node_id_from_dpu_node_cr_name,
+    BmcPasswordProvider, DpfError, DpfSdk, DpuDeviceInfo, DpuNodeInfo, DpuPhase, KubeRepository,
+    ResourceLabeler, node_id_from_dpu_node_cr_name,
 };
 use sqlx::PgPool;
+use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 
 use crate::cfg::file::CarbideConfig;
 use crate::state_controller::controller::Enqueuer;
@@ -226,14 +228,17 @@ impl BmcPasswordProvider for CarbideBmcPasswordProvider {
 /// DPF SDK operations implementation that wraps the real DPF SDK.
 pub struct DpfSdkOps {
     sdk: Arc<DpfSdk<KubeRepository, CarbideDPFLabeler>>,
-    _watcher: DpuWatcher,
 }
 
 impl DpfSdkOps {
     /// Create a new DpfSdkOps using the DPF SDK and sets up watcher callbacks to trigger carbide state handling.
-    pub fn new(sdk: Arc<DpfSdk<KubeRepository, CarbideDPFLabeler>>, db_pool: PgPool) -> Self {
-        let watcher = sdk
-            .watcher()
+    pub fn new(
+        sdk: Arc<DpfSdk<KubeRepository, CarbideDPFLabeler>>,
+        db_pool: PgPool,
+        join_set: &mut JoinSet<()>,
+        cancel_token: CancellationToken,
+    ) -> Self {
+        sdk.watcher()
             .on_dpu_event(|event| async move {
                 tracing::debug!(
                     dpu = %event.dpu_name,
@@ -300,12 +305,9 @@ impl DpfSdkOps {
                     }
                 }
             })
-            .start();
+            .start_in_join_set(join_set, cancel_token);
 
-        Self {
-            sdk,
-            _watcher: watcher,
-        }
+        Self { sdk }
     }
 }
 

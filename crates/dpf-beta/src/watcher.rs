@@ -37,6 +37,9 @@
 use std::future::Future;
 use std::sync::Arc;
 
+use tokio::task::JoinSet;
+use tokio_util::sync::{CancellationToken, DropGuard};
+
 use crate::crds::dpus_generated::{DPU, DpuStatusPhase};
 use crate::error::DpfError;
 use crate::repository::DpuRepository;
@@ -73,13 +76,14 @@ struct Callbacks<DE, RB, RD, MN, ER> {
 /// not the actual event gathering. The repository implementation handles procuring
 /// the events, as well as retries and requeuing when handlers return `Err`.
 pub struct DpuWatcher {
-    watcher_task: tokio::task::JoinHandle<()>,
+    join_set: tokio::task::JoinSet<()>,
+    _drop_guard: DropGuard,
 }
 
 /// The watcher continues running until this struct is dropped.
 impl Drop for DpuWatcher {
     fn drop(&mut self) {
-        self.watcher_task.abort();
+        self.join_set.abort_all();
     }
 }
 
@@ -254,17 +258,26 @@ impl<R: DpuRepository, DE, RB, RD, MN, ER> DpuWatcherBuilder<R, DE, RB, RD, MN, 
 
 impl<R, DE, RB, RD, MN, ER> DpuWatcherBuilder<R, DE, RB, RD, MN, ER>
 where
-    R: DpuRepository,
+    R: DpuRepository + 'static,
     DE: DPUStateCallback<DpuEvent>,
     RB: DPUStateCallback<RebootRequiredEvent>,
     RD: DPUStateCallback<DpuReadyEvent>,
     MN: DPUStateCallback<MaintenanceEvent>,
     ER: DPUStateCallback<DpuErrorEvent>,
 {
-    /// Start watching for events.
-    ///
-    /// Returns a handle that stops the watcher when dropped.
+    /// Start watching for events, returning a handle that stops the watcher when dropped.
     pub fn start(self) -> DpuWatcher {
+        let mut join_set = JoinSet::new();
+        let cancel_token = CancellationToken::new();
+        self.start_in_join_set(&mut join_set, cancel_token.clone());
+        DpuWatcher {
+            join_set,
+            _drop_guard: cancel_token.drop_guard(),
+        }
+    }
+
+    /// Start watching for events in the given [`JoinSet`], cancelling on the given [`CancellationToken`]
+    pub fn start_in_join_set(self, join_set: &mut JoinSet<()>, cancel_token: CancellationToken) {
         let cbs = Arc::new(self.cbs);
 
         let handler = move |dpu: Arc<DPU>| {
@@ -328,12 +341,14 @@ where
             }
         };
 
-        DpuWatcher {
-            watcher_task: tokio::spawn(self.repo.watch(
-                &self.namespace,
-                self.label_selector.as_deref(),
-                handler,
-            )),
-        }
+        join_set.spawn(async move {
+            cancel_token
+                .run_until_cancelled(self.repo.watch(
+                    &self.namespace,
+                    self.label_selector.as_deref(),
+                    handler,
+                ))
+                .await;
+        });
     }
 }

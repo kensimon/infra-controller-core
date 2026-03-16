@@ -52,20 +52,14 @@ pub struct KubeRepository {
 
 impl KubeRepository {
     /// Create a new KubeRepository with the default in-cluster or kubeconfig client.
-    pub async fn new() -> Result<Self, DpfError> {
+    pub async fn new(cancel: CancellationToken) -> Result<Self, DpfError> {
         let client = Client::try_default().await?;
-        Ok(Self {
-            client,
-            cancel: CancellationToken::new(),
-        })
+        Ok(Self { client, cancel })
     }
 
     /// Create a new KubeRepository with a provided client.
-    pub fn with_client(client: Client) -> Self {
-        Self {
-            client,
-            cancel: CancellationToken::new(),
-        }
+    pub fn with_client(client: Client, cancel: CancellationToken) -> Self {
+        Self { client, cancel }
     }
 
     /// Get a reference to the underlying Kubernetes client.
