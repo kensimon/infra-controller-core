@@ -81,41 +81,25 @@ pub async fn save(
 /// other columns are applied (same as the legacy JSON builder).
 pub async fn update(
     txn: &mut PgConnection,
-    mut req: MachineValidationTestUpdateRequest,
+    req: MachineValidationTestUpdateRequest,
 ) -> DatabaseResult<String> {
-    let Some(payload) = req.payload.as_mut() else {
-        return Err(DatabaseError::InvalidArgument(
-            "Payload is missing".to_owned(),
-        ));
-    };
-    let mut columns = ColumnSet::from(payload);
-
-    if columns.is_empty() {
-        return Err(DatabaseError::InvalidArgument(
-            "Nothing to update".to_string(),
-        ));
-    }
-
-    if payload.verified.is_none() {
-        columns.push("verified", false);
-    }
-    columns.push("modified_by", "User");
+    let test_id = req.test_id.clone();
+    let version = req.version.clone();
 
     let mut qb = QueryBuilder::new("UPDATE ");
     let q = qb
         .push(MVT_TABLE)
-        .push_values_for_update(columns)
+        .push_values_for_update(req.try_into()?)
         .push(" WHERE test_id = ")
-        .push_bind(&req.test_id)
+        .push_bind(&test_id)
         .push(" AND version = ")
-        .push_bind(&req.version)
+        .push_bind(&version)
         .push(" RETURNING test_id")
         .build_query_scalar::<String>();
     let sql = q.sql();
     q.fetch_one(&mut *txn)
         .await
-        .map_err(|e| DatabaseError::query(sql, e))?;
-    Ok(req.test_id)
+        .map_err(|e| DatabaseError::query(sql, e))
 }
 
 pub async fn clone(
@@ -251,8 +235,14 @@ impl<'a> From<WithVersion<'a, MachineValidationTestAddRequest>> for ColumnSet<'a
     }
 }
 
-impl<'a> From<&'a mut MachineValidationTestUpdatePayload> for ColumnSet<'a> {
-    fn from(payload: &'a mut MachineValidationTestUpdatePayload) -> Self {
+impl<'a> TryFrom<MachineValidationTestUpdateRequest> for ColumnSet<'a> {
+    type Error = DatabaseError;
+    fn try_from(req: MachineValidationTestUpdateRequest) -> Result<Self, Self::Error> {
+        let Some(mut payload) = req.payload else {
+            return Err(DatabaseError::InvalidArgument(
+                "Payload is missing".to_owned(),
+            ));
+        };
         let re = Regex::new(r"[ =;:@#\!?\-]").unwrap();
         payload.supported_platforms = payload
             .supported_platforms
@@ -261,31 +251,39 @@ impl<'a> From<&'a mut MachineValidationTestUpdatePayload> for ColumnSet<'a> {
             .collect();
 
         let mut columns = ColumnSet::new();
-        columns.push_if_some("name", payload.name.as_deref());
-        columns.push_if_some("description", payload.description.as_deref());
-        columns.push_if_some("contexts", payload.contexts.if_non_empty());
-        columns.push_if_some("img_name", payload.img_name.as_deref());
+        columns.push_if_some("name", payload.name);
+        columns.push_if_some("description", payload.description);
+        columns.push_if_some("contexts", payload.contexts.if_non_empty_owned());
+        columns.push_if_some("img_name", payload.img_name);
         columns.push_if_some("execute_in_host", payload.execute_in_host);
-        columns.push_if_some("container_arg", payload.container_arg.as_deref());
-        columns.push_if_some("command", payload.command.as_deref());
-        columns.push_if_some("args", payload.args.as_deref());
-        columns.push_if_some("extra_err_file", payload.extra_err_file.as_deref());
-        columns.push_if_some(
-            "external_config_file",
-            payload.external_config_file.as_deref(),
-        );
-        columns.push_if_some("pre_condition", payload.pre_condition.as_deref());
+        columns.push_if_some("container_arg", payload.container_arg);
+        columns.push_if_some("command", payload.command);
+        columns.push_if_some("args", payload.args);
+        columns.push_if_some("extra_err_file", payload.extra_err_file);
+        columns.push_if_some("external_config_file", payload.external_config_file);
+        columns.push_if_some("pre_condition", payload.pre_condition);
         columns.push_if_some("timeout", payload.timeout);
-        columns.push_if_some("extra_output_file", payload.extra_output_file.as_deref());
+        columns.push_if_some("extra_output_file", payload.extra_output_file);
         columns.push_if_some(
             "supported_platforms",
-            payload.supported_platforms.if_non_empty(),
+            payload.supported_platforms.if_non_empty_owned(),
         );
         columns.push_if_some("verified", payload.verified);
-        columns.push_if_some("custom_tags", payload.custom_tags.if_non_empty());
-        columns.push_if_some("components", payload.components.if_non_empty());
+        columns.push_if_some("custom_tags", payload.custom_tags.if_non_empty_owned());
+        columns.push_if_some("components", payload.components.if_non_empty_owned());
         columns.push_if_some("is_enabled", payload.is_enabled);
-        columns
+
+        if columns.is_empty() {
+            return Err(DatabaseError::InvalidArgument(
+                "Nothing to update".to_string(),
+            ));
+        }
+
+        if payload.verified.is_none() {
+            columns.push("verified", false);
+        }
+        columns.push("modified_by", "User");
+        Ok(columns)
     }
 }
 

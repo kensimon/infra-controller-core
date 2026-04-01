@@ -104,7 +104,10 @@ impl<'a> PushValuesForInsert<'a> for QueryBuilder<'a, Postgres> {
                 ColumnKind::String(s) => {
                     values_qb.push_bind(s);
                 }
-                ColumnKind::Strings(s) => {
+                ColumnKind::Strings(Cow::Borrowed(s)) => {
+                    values_qb.push_bind(s);
+                }
+                ColumnKind::Strings(Cow::Owned(s)) => {
                     values_qb.push_bind(s);
                 }
                 ColumnKind::I64(i) => {
@@ -136,7 +139,10 @@ impl<'a> PushValuesForUpdate<'a> for QueryBuilder<'a, Postgres> {
                 ColumnKind::String(v) => {
                     sets.push_bind(v);
                 }
-                ColumnKind::Strings(v) => {
+                ColumnKind::Strings(Cow::Borrowed(v)) => {
+                    sets.push_bind(v);
+                }
+                ColumnKind::Strings(Cow::Owned(v)) => {
                     sets.push_bind(v);
                 }
                 ColumnKind::I64(v) => {
@@ -183,7 +189,10 @@ impl<'a> PushAsWhereClause<'a> for QueryBuilder<'a, Postgres> {
                 ColumnKind::String(v) => {
                     self.push_bind(v);
                 }
-                ColumnKind::Strings(v) => {
+                ColumnKind::Strings(Cow::Borrowed(v)) => {
+                    self.push_bind(v);
+                }
+                ColumnKind::Strings(Cow::Owned(v)) => {
                     self.push_bind(v);
                 }
                 ColumnKind::I64(v) => {
@@ -212,7 +221,7 @@ pub enum ColumnWrap {
 pub enum ColumnKind<'a> {
     Bool(bool),
     String(Cow<'a, str>),
-    Strings(&'a Vec<String>),
+    Strings(Cow<'a, Vec<String>>),
     I64(i64),
 }
 
@@ -230,7 +239,13 @@ impl<'a> From<String> for ColumnKind<'a> {
 
 impl<'a> From<&'a Vec<String>> for ColumnKind<'a> {
     fn from(value: &'a Vec<String>) -> Self {
-        Self::Strings(value)
+        Self::Strings(Cow::Borrowed(value))
+    }
+}
+
+impl<'a> From<Vec<String>> for ColumnKind<'a> {
+    fn from(value: Vec<String>) -> Self {
+        Self::Strings(Cow::Owned(value))
     }
 }
 
@@ -248,10 +263,17 @@ impl<'a> From<i64> for ColumnKind<'a> {
 
 pub trait IfNonEmpty {
     fn if_non_empty(&self) -> Option<&Self>;
+    fn if_non_empty_owned(self) -> Option<Self>
+    where
+        Self: Sized;
 }
 
 impl IfNonEmpty for Vec<String> {
     fn if_non_empty(&self) -> Option<&Self> {
         if self.is_empty() { None } else { Some(&self) }
+    }
+
+    fn if_non_empty_owned(self) -> Option<Self> {
+        if self.is_empty() { None } else { Some(self) }
     }
 }
