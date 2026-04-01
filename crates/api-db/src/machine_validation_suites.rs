@@ -21,50 +21,31 @@ use model::machine_validation::{
     MachineValidationTestUpdateRequest, MachineValidationTestsGetRequest,
 };
 use regex::Regex;
-use sqlx::{Execute, PgConnection, Postgres, QueryBuilder};
+use sqlx::{Execute, PgConnection, QueryBuilder};
 
-use crate::column_set::{ColumnSet, IfNonEmpty, PushValuesForInsert, PushValuesForUpdate};
+use crate::column_set::{
+    ColumnSet, ColumnWrap, IfNonEmpty, PushAsWhereClause, PushValuesForInsert, PushValuesForUpdate,
+};
 use crate::db_read::DbReader;
 use crate::{DatabaseError, DatabaseResult};
 
 const MVT_TABLE: &str = "machine_validation_tests";
 
-fn push_select_filters<'a>(
-    qb: &mut QueryBuilder<'a, Postgres>,
-    req: &'a MachineValidationTestsGetRequest,
-) {
-    if let Some(ref tid) = req.test_id {
-        qb.push(" AND LOWER(test_id) = LOWER(");
-        qb.push_bind(tid);
-        qb.push(")");
-    }
-    if let Some(ref v) = req.version {
-        qb.push(" AND version = ");
-        qb.push_bind(v);
-    }
-    if let Some(b) = req.is_enabled {
-        qb.push(" AND is_enabled = ");
-        qb.push_bind(b);
-    }
-    if let Some(b) = req.verified {
-        qb.push(" AND verified = ");
-        qb.push_bind(b);
-    }
-    if let Some(b) = req.read_only {
-        qb.push(" AND read_only = ");
-        qb.push_bind(b);
-    }
-    if !req.supported_platforms.is_empty() {
-        qb.push(" AND supported_platforms && ");
-        qb.push_bind(&req.supported_platforms);
-    }
-    if !req.contexts.is_empty() {
-        qb.push(" AND contexts && ");
-        qb.push_bind(&req.contexts);
-    }
-    if !req.custom_tags.is_empty() {
-        qb.push(" AND custom_tags && ");
-        qb.push_bind(&req.custom_tags);
+impl<'a> From<&'a MachineValidationTestsGetRequest> for ColumnSet<'a> {
+    fn from(req: &'a MachineValidationTestsGetRequest) -> Self {
+        let mut column_set = ColumnSet::new();
+        column_set.push_wrapped_if_some("test_id", req.test_id.as_deref(), ColumnWrap::ToLower);
+        column_set.push_if_some("version", req.version.as_deref());
+        column_set.push_if_some("is_enabled", req.is_enabled);
+        column_set.push_if_some("verified", req.verified);
+        column_set.push_if_some("read_only", req.read_only);
+        column_set.push_if_some(
+            "supported_platforms",
+            req.supported_platforms.if_non_empty(),
+        );
+        column_set.push_if_some("contexts", req.contexts.if_non_empty());
+        column_set.push_if_some("custom_tags", req.custom_tags.if_non_empty());
+        column_set
     }
 }
 
@@ -74,8 +55,7 @@ pub async fn find(
 ) -> DatabaseResult<Vec<MachineValidationTest>> {
     let mut qb = QueryBuilder::new("SELECT * FROM ");
     qb.push(MVT_TABLE);
-    qb.push(" WHERE 1=1");
-    push_select_filters(&mut qb, &req);
+    qb.push_as_where_clause(ColumnSet::from(&req));
     qb.push(" ORDER BY version DESC, name ASC");
     let q = qb.build_query_as::<MachineValidationTest>();
     let sql = q.sql();
@@ -304,11 +284,12 @@ mod tests {
             ..Default::default()
         };
         let mut qb = QueryBuilder::new("SELECT * FROM ");
-        qb.push(MVT_TABLE);
-        qb.push(" WHERE 1=1");
-        push_select_filters(&mut qb, &req);
-        qb.push(" ORDER BY version DESC, name ASC");
-        let sql = qb.build().sql();
+        let sql = qb
+            .push(MVT_TABLE)
+            .push_as_where_clause(ColumnSet::from(&req))
+            .push(" ORDER BY version DESC, name ASC")
+            .build()
+            .sql();
         assert!(
             sql.contains("LOWER(test_id)"),
             "Expected LOWER(test_id), got: {sql}"
@@ -326,10 +307,11 @@ mod tests {
             ..Default::default()
         };
         let mut qb = QueryBuilder::new("SELECT * FROM ");
-        qb.push(MVT_TABLE);
-        qb.push(" WHERE 1=1");
-        push_select_filters(&mut qb, &req);
-        let sql = qb.build().sql();
+        let sql = qb
+            .push(MVT_TABLE)
+            .push_as_where_clause(ColumnSet::from(&req))
+            .build()
+            .sql();
         assert!(
             sql.contains("is_enabled = $"),
             "Expected parameterized is_enabled, got: {sql}"
@@ -340,10 +322,11 @@ mod tests {
     fn select_query_empty_request_is_select_all() {
         let req = MachineValidationTestsGetRequest::default();
         let mut qb = QueryBuilder::new("SELECT * FROM ");
-        qb.push(MVT_TABLE);
-        qb.push(" WHERE 1=1");
-        push_select_filters(&mut qb, &req);
-        let sql = qb.build().sql();
+        let sql = qb
+            .push(MVT_TABLE)
+            .push_as_where_clause(ColumnSet::from(&req))
+            .build()
+            .sql();
         assert!(
             sql.contains("WHERE 1=1"),
             "Empty request should have no extra filters, got: {sql}"
