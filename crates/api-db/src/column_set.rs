@@ -24,17 +24,21 @@ impl<'a> ColumnSet<'a> {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
+
     fn into_parts(self) -> (Vec<&'static str>, Vec<ColumnValue<'a>>) {
         self.set.into_iter().unzip()
     }
 }
 
 pub trait PushValuesForInsert<'a> {
-    fn push_values_for_insert(&mut self, column_set: ColumnSet<'a>);
+    fn push_values_for_insert(&mut self, column_set: ColumnSet<'a>) -> &mut Self;
 }
 
 impl<'a> PushValuesForInsert<'a> for QueryBuilder<'a, Postgres> {
-    fn push_values_for_insert(&mut self, column_set: ColumnSet<'a>) {
+    fn push_values_for_insert(&mut self, column_set: ColumnSet<'a>) -> &mut Self {
         let (columns, values) = column_set.into_parts();
 
         self.push(" (");
@@ -63,6 +67,39 @@ impl<'a> PushValuesForInsert<'a> for QueryBuilder<'a, Postgres> {
             }
         }
         self.push(")");
+        self
+    }
+}
+
+pub trait PushValuesForUpdate<'a> {
+    fn push_values_for_update(&mut self, column_set: ColumnSet<'a>) -> &mut Self;
+}
+
+impl<'a> PushValuesForUpdate<'a> for QueryBuilder<'a, Postgres> {
+    fn push_values_for_update(&mut self, column_set: ColumnSet<'a>) -> &mut Self {
+        self.push(" SET ");
+        let mut sets = self.separated(", ");
+
+        for (column, value) in column_set.set {
+            sets.push_unseparated(column);
+            sets.push_unseparated(" = ");
+            match value {
+                ColumnValue::Bool(v) => {
+                    sets.push_bind(v);
+                }
+                ColumnValue::String(v) => {
+                    sets.push_bind(v);
+                }
+                ColumnValue::Strings(v) => {
+                    sets.push_bind(v);
+                }
+                ColumnValue::I64(v) => {
+                    sets.push_bind(v);
+                }
+            }
+        }
+
+        self
     }
 }
 

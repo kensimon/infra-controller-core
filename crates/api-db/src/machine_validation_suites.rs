@@ -23,119 +23,11 @@ use model::machine_validation::{
 use regex::Regex;
 use sqlx::{Execute, PgConnection, Postgres, QueryBuilder};
 
-use crate::column_set::{ColumnSet, IfNonEmpty, PushValuesForInsert};
+use crate::column_set::{ColumnSet, IfNonEmpty, PushValuesForInsert, PushValuesForUpdate};
 use crate::db_read::DbReader;
 use crate::{DatabaseError, DatabaseResult};
 
 const MVT_TABLE: &str = "machine_validation_tests";
-
-/// UPDATE: at least one non-verified field or explicit `verified` must be present, or
-/// `InvalidArgument("Nothing to update")`. If `verified` is omitted, it is set to `false` after
-/// other columns are applied (same as the legacy JSON builder).
-fn push_update<'a>(
-    payload: &'a MachineValidationTestUpdatePayload,
-    version: &'a str,
-    test_id: &'a str,
-    modified_by: &'a str,
-) -> DatabaseResult<QueryBuilder<'a, Postgres>> {
-    let mut qb = QueryBuilder::new("UPDATE ");
-    qb.push(MVT_TABLE);
-    qb.push(" SET ");
-    let mut sets = qb.separated(", ");
-
-    let mut n = 0usize;
-    if let Some(ref v) = payload.name {
-        sets.push("name = ").push_bind(v);
-        n += 1;
-    }
-    if let Some(ref v) = payload.description {
-        sets.push("description = ").push_bind(v);
-        n += 1;
-    }
-    if !payload.contexts.is_empty() {
-        sets.push("contexts = ").push_bind(&payload.contexts);
-        n += 1;
-    }
-    if let Some(ref v) = payload.img_name {
-        sets.push("img_name = ").push_bind(v);
-        n += 1;
-    }
-    if let Some(v) = payload.execute_in_host {
-        sets.push("execute_in_host = ").push_bind(v);
-        n += 1;
-    }
-    if let Some(ref v) = payload.container_arg {
-        sets.push("container_arg = ").push_bind(v);
-        n += 1;
-    }
-    if let Some(ref v) = payload.command {
-        sets.push("command = ").push_bind(v);
-        n += 1;
-    }
-    if let Some(ref v) = payload.args {
-        sets.push("args = ").push_bind(v);
-        n += 1;
-    }
-    if let Some(ref v) = payload.extra_err_file {
-        sets.push("extra_err_file = ").push_bind(v);
-        n += 1;
-    }
-    if let Some(ref v) = payload.external_config_file {
-        sets.push("external_config_file = ").push_bind(v);
-        n += 1;
-    }
-    if let Some(ref v) = payload.pre_condition {
-        sets.push("pre_condition = ").push_bind(v);
-        n += 1;
-    }
-    if let Some(v) = payload.timeout {
-        sets.push("timeout = ").push_bind(v);
-        n += 1;
-    }
-    if let Some(ref v) = payload.extra_output_file {
-        sets.push("extra_output_file = ").push_bind(v);
-        n += 1;
-    }
-    if !payload.supported_platforms.is_empty() {
-        sets.push("supported_platforms = ")
-            .push_bind(&payload.supported_platforms);
-        n += 1;
-    }
-    if let Some(v) = payload.verified {
-        sets.push("verified = ").push_bind(v);
-        n += 1;
-    }
-    if !payload.custom_tags.is_empty() {
-        sets.push("custom_tags = ").push_bind(&payload.custom_tags);
-        n += 1;
-    }
-    if !payload.components.is_empty() {
-        sets.push("components = ").push_bind(&payload.components);
-        n += 1;
-    }
-    if let Some(v) = payload.is_enabled {
-        sets.push("is_enabled = ").push_bind(v);
-        n += 1;
-    }
-
-    if n == 0 {
-        return Err(DatabaseError::InvalidArgument(
-            "Nothing to update".to_string(),
-        ));
-    }
-
-    if payload.verified.is_none() {
-        sets.push("verified = ").push_bind(false);
-    }
-
-    sets.push("modified_by = ").push_bind(modified_by);
-    qb.push(" WHERE test_id = ")
-        .push_bind(test_id)
-        .push(" AND version = ")
-        .push_bind(version)
-        .push(" RETURNING test_id");
-    Ok(qb)
-}
 
 fn push_select_filters<'a>(
     qb: &mut QueryBuilder<'a, Postgres>,
@@ -256,6 +148,9 @@ pub async fn save(
     Ok(test_id)
 }
 
+/// UPDATE: at least one non-verified field or explicit `verified` must be present, or
+/// `InvalidArgument("Nothing to update")`. If `verified` is omitted, it is set to `false` after
+/// other columns are applied (same as the legacy JSON builder).
 pub async fn update(
     txn: &mut PgConnection,
     req: MachineValidationTestUpdateRequest,
@@ -272,8 +167,53 @@ pub async fn update(
         .map(|p| re.replace_all(p, "_").to_string().to_ascii_lowercase())
         .collect();
 
-    let mut qb = push_update(&payload, &req.version, &req.test_id, "User")?;
-    let q = qb.build_query_scalar::<String>();
+    let mut columns = ColumnSet::new();
+    columns.push_if_some("name", payload.name.as_deref());
+    columns.push_if_some("description", payload.description.as_deref());
+    columns.push_if_some("contexts", payload.contexts.if_non_empty());
+    columns.push_if_some("img_name", payload.img_name.as_deref());
+    columns.push_if_some("execute_in_host", payload.execute_in_host);
+    columns.push_if_some("container_arg", payload.container_arg.as_deref());
+    columns.push_if_some("command", payload.command.as_deref());
+    columns.push_if_some("args", payload.args.as_deref());
+    columns.push_if_some("extra_err_file", payload.extra_err_file.as_deref());
+    columns.push_if_some(
+        "external_config_file",
+        payload.external_config_file.as_deref(),
+    );
+    columns.push_if_some("pre_condition", payload.pre_condition.as_deref());
+    columns.push_if_some("timeout", payload.timeout);
+    columns.push_if_some("extra_output_file", payload.extra_output_file.as_deref());
+    columns.push_if_some(
+        "supported_platforms",
+        payload.supported_platforms.if_non_empty(),
+    );
+    columns.push_if_some("verified", payload.verified);
+    columns.push_if_some("custom_tags", payload.custom_tags.if_non_empty());
+    columns.push_if_some("components", payload.components.if_non_empty());
+    columns.push_if_some("is_enabled", payload.is_enabled);
+
+    if columns.is_empty() {
+        return Err(DatabaseError::InvalidArgument(
+            "Nothing to update".to_string(),
+        ));
+    }
+
+    if payload.verified.is_none() {
+        columns.push("verified", false);
+    }
+    columns.push("modified_by", "User");
+
+    let mut qb = QueryBuilder::new("UPDATE ");
+    let q = qb
+        .push(MVT_TABLE)
+        .push_values_for_update(columns)
+        .push(" WHERE test_id = ")
+        .push_bind(&req.test_id)
+        .push(" AND version = ")
+        .push_bind(&req.version)
+        .push(" RETURNING test_id")
+        .build_query_scalar::<String>();
     let sql = q.sql();
     q.fetch_one(&mut *txn)
         .await
