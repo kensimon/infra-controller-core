@@ -22,6 +22,7 @@
 pub mod attestation;
 pub mod bmc_metadata;
 pub mod carbide_version;
+pub mod column_set;
 pub mod compute_allocation;
 pub mod db_read;
 pub mod desired_firmware;

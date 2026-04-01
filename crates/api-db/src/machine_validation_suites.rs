@@ -21,136 +21,13 @@ use model::machine_validation::{
     MachineValidationTestUpdateRequest, MachineValidationTestsGetRequest,
 };
 use regex::Regex;
-use sqlx::PgConnection;
-use sqlx::Postgres;
-use sqlx::QueryBuilder;
-use sqlx::Execute;
+use sqlx::{Execute, PgConnection, Postgres, QueryBuilder};
 
+use crate::column_set::{ColumnSet, IfNonEmpty, PushValuesForInsert};
 use crate::db_read::DbReader;
 use crate::{DatabaseError, DatabaseResult};
 
 const MVT_TABLE: &str = "machine_validation_tests";
-
-/// INSERT semantics match the previous serde_json-driven builder: skip `Option::None`, skip empty
-/// `Vec`s for array columns, always set `version`, `test_id`, `modified_by`.
-fn push_insert<'a>(
-    req: &'a MachineValidationTestAddRequest,
-    version: &'a str,
-    test_id: &'a str,
-    modified_by: &'a str,
-) -> QueryBuilder<'a, Postgres> {
-    let mut qb = QueryBuilder::new("INSERT INTO ");
-    qb.push(MVT_TABLE);
-    qb.push(" (");
-    let mut cols = qb.separated(", ");
-    cols.push("name");
-    if req.description.is_some() {
-        cols.push("description");
-    }
-    if !req.contexts.is_empty() {
-        cols.push("contexts");
-    }
-    if req.img_name.is_some() {
-        cols.push("img_name");
-    }
-    if req.execute_in_host.is_some() {
-        cols.push("execute_in_host");
-    }
-    if req.container_arg.is_some() {
-        cols.push("container_arg");
-    }
-    cols.push("command");
-    cols.push("args");
-    if req.extra_err_file.is_some() {
-        cols.push("extra_err_file");
-    }
-    if req.external_config_file.is_some() {
-        cols.push("external_config_file");
-    }
-    if req.pre_condition.is_some() {
-        cols.push("pre_condition");
-    }
-    if req.timeout.is_some() {
-        cols.push("timeout");
-    }
-    if req.extra_output_file.is_some() {
-        cols.push("extra_output_file");
-    }
-    if !req.supported_platforms.is_empty() {
-        cols.push("supported_platforms");
-    }
-    if req.read_only.is_some() {
-        cols.push("read_only");
-    }
-    if !req.custom_tags.is_empty() {
-        cols.push("custom_tags");
-    }
-    if !req.components.is_empty() {
-        cols.push("components");
-    }
-    if req.is_enabled.is_some() {
-        cols.push("is_enabled");
-    }
-    cols.push("version");
-    cols.push("test_id");
-    cols.push("modified_by");
-
-    qb.push(") VALUES (");
-    let mut vals = qb.separated(", ");
-    vals.push_bind(&req.name);
-    if let Some(ref d) = req.description {
-        vals.push_bind(d);
-    }
-    if !req.contexts.is_empty() {
-        vals.push_bind(&req.contexts);
-    }
-    if let Some(ref v) = req.img_name {
-        vals.push_bind(v);
-    }
-    if let Some(v) = req.execute_in_host {
-        vals.push_bind(v);
-    }
-    if let Some(ref v) = req.container_arg {
-        vals.push_bind(v);
-    }
-    vals.push_bind(&req.command);
-    vals.push_bind(&req.args);
-    if let Some(ref v) = req.extra_err_file {
-        vals.push_bind(v);
-    }
-    if let Some(ref v) = req.external_config_file {
-        vals.push_bind(v);
-    }
-    if let Some(ref v) = req.pre_condition {
-        vals.push_bind(v);
-    }
-    if let Some(v) = req.timeout {
-        vals.push_bind(v);
-    }
-    if let Some(ref v) = req.extra_output_file {
-        vals.push_bind(v);
-    }
-    if !req.supported_platforms.is_empty() {
-        vals.push_bind(&req.supported_platforms);
-    }
-    if let Some(v) = req.read_only {
-        vals.push_bind(v);
-    }
-    if !req.custom_tags.is_empty() {
-        vals.push_bind(&req.custom_tags);
-    }
-    if !req.components.is_empty() {
-        vals.push_bind(&req.components);
-    }
-    if let Some(v) = req.is_enabled {
-        vals.push_bind(v);
-    }
-    vals.push_bind(version);
-    vals.push_bind(test_id);
-    vals.push_bind(modified_by);
-    qb.push(") RETURNING test_id");
-    qb
-}
 
 /// UPDATE: at least one non-verified field or explicit `verified` must be present, or
 /// `InvalidArgument("Nothing to update")`. If `verified` is omitted, it is set to `false` after
@@ -319,6 +196,9 @@ pub fn generate_test_id(name: &str) -> String {
     format!("forge_{}", name.to_ascii_lowercase())
 }
 
+/// INSERT semantics match the previous serde_json-driven builder: skip `Option::None`, skip empty
+/// `Vec`s for array columns, always set `version`, `test_id`, `modified_by`.
+
 pub async fn save(
     txn: &mut PgConnection,
     mut req: MachineValidationTestAddRequest,
@@ -332,14 +212,40 @@ pub async fn save(
         .iter()
         .map(|p| re.replace_all(p, "_").to_string().to_ascii_lowercase())
         .collect();
+    let version_string = version.version_string();
 
-    let version_s = version.version_string();
-    let mut qb = push_insert(
-        &req,
-        version_s.as_str(),
-        &test_id,
-        "User",
+    let mut cols = ColumnSet::default();
+    cols.push("name", req.name.as_str());
+    cols.push("command", req.command.as_str());
+    cols.push("args", req.args.as_str());
+    cols.push("version", version_string.as_str());
+    cols.push("test_id", test_id.as_str());
+    cols.push("modified_by", "User");
+
+    cols.push_if_some("description", req.description.as_deref());
+    cols.push_if_some("contexts", req.contexts.if_non_empty());
+    cols.push_if_some("img_name", req.img_name.as_deref());
+    cols.push_if_some("execute_in_host", req.execute_in_host);
+    cols.push_if_some("container_arg", req.container_arg.as_deref());
+    cols.push_if_some("extra_err_file", req.extra_err_file.as_deref());
+    cols.push_if_some("external_config_file", req.external_config_file.as_deref());
+    cols.push_if_some("pre_condition", req.pre_condition.as_deref());
+    cols.push_if_some("timeout", req.timeout);
+    cols.push_if_some("extra_output_file", req.extra_output_file.as_deref());
+    cols.push_if_some(
+        "supported_platforms",
+        req.supported_platforms.if_non_empty(),
     );
+    cols.push_if_some("read_only", req.read_only);
+    cols.push_if_some("custom_tags", req.custom_tags.if_non_empty());
+    cols.push_if_some("components", req.components.if_non_empty());
+    cols.push_if_some("is_enabled", req.is_enabled);
+
+    let mut qb = QueryBuilder::new("INSERT INTO ");
+    qb.push(MVT_TABLE);
+    qb.push_values_for_insert(cols);
+    qb.push(" RETURNING test_id");
+
     let q = qb.build_query_scalar::<String>();
     let sql = q.sql();
     let returned = q
@@ -366,12 +272,7 @@ pub async fn update(
         .map(|p| re.replace_all(p, "_").to_string().to_ascii_lowercase())
         .collect();
 
-    let mut qb = push_update(
-        &payload,
-        &req.version,
-        &req.test_id,
-        "User",
-    )?;
+    let mut qb = push_update(&payload, &req.version, &req.test_id, "User")?;
     let q = qb.build_query_scalar::<String>();
     let sql = q.sql();
     q.fetch_one(&mut *txn)
