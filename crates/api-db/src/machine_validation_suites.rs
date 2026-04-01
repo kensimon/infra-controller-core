@@ -81,45 +81,14 @@ pub async fn save(
 /// other columns are applied (same as the legacy JSON builder).
 pub async fn update(
     txn: &mut PgConnection,
-    req: MachineValidationTestUpdateRequest,
+    mut req: MachineValidationTestUpdateRequest,
 ) -> DatabaseResult<String> {
-    let Some(mut payload) = req.payload else {
+    let Some(payload) = req.payload.as_mut() else {
         return Err(DatabaseError::InvalidArgument(
             "Payload is missing".to_owned(),
         ));
     };
-    let re = Regex::new(r"[ =;:@#\!?\-]").unwrap();
-    payload.supported_platforms = payload
-        .supported_platforms
-        .iter()
-        .map(|p| re.replace_all(p, "_").to_string().to_ascii_lowercase())
-        .collect();
-
-    let mut columns = ColumnSet::new();
-    columns.push_if_some("name", payload.name.as_deref());
-    columns.push_if_some("description", payload.description.as_deref());
-    columns.push_if_some("contexts", payload.contexts.if_non_empty());
-    columns.push_if_some("img_name", payload.img_name.as_deref());
-    columns.push_if_some("execute_in_host", payload.execute_in_host);
-    columns.push_if_some("container_arg", payload.container_arg.as_deref());
-    columns.push_if_some("command", payload.command.as_deref());
-    columns.push_if_some("args", payload.args.as_deref());
-    columns.push_if_some("extra_err_file", payload.extra_err_file.as_deref());
-    columns.push_if_some(
-        "external_config_file",
-        payload.external_config_file.as_deref(),
-    );
-    columns.push_if_some("pre_condition", payload.pre_condition.as_deref());
-    columns.push_if_some("timeout", payload.timeout);
-    columns.push_if_some("extra_output_file", payload.extra_output_file.as_deref());
-    columns.push_if_some(
-        "supported_platforms",
-        payload.supported_platforms.if_non_empty(),
-    );
-    columns.push_if_some("verified", payload.verified);
-    columns.push_if_some("custom_tags", payload.custom_tags.if_non_empty());
-    columns.push_if_some("components", payload.components.if_non_empty());
-    columns.push_if_some("is_enabled", payload.is_enabled);
+    let mut columns = ColumnSet::from(payload);
 
     if columns.is_empty() {
         return Err(DatabaseError::InvalidArgument(
@@ -279,6 +248,44 @@ impl<'a> From<WithVersion<'a, MachineValidationTestAddRequest>> for ColumnSet<'a
         cols.push_if_some("components", req.components.if_non_empty());
         cols.push_if_some("is_enabled", req.is_enabled);
         cols
+    }
+}
+
+impl<'a> From<&'a mut MachineValidationTestUpdatePayload> for ColumnSet<'a> {
+    fn from(payload: &'a mut MachineValidationTestUpdatePayload) -> Self {
+        let re = Regex::new(r"[ =;:@#\!?\-]").unwrap();
+        payload.supported_platforms = payload
+            .supported_platforms
+            .iter()
+            .map(|p| re.replace_all(p, "_").to_string().to_ascii_lowercase())
+            .collect();
+
+        let mut columns = ColumnSet::new();
+        columns.push_if_some("name", payload.name.as_deref());
+        columns.push_if_some("description", payload.description.as_deref());
+        columns.push_if_some("contexts", payload.contexts.if_non_empty());
+        columns.push_if_some("img_name", payload.img_name.as_deref());
+        columns.push_if_some("execute_in_host", payload.execute_in_host);
+        columns.push_if_some("container_arg", payload.container_arg.as_deref());
+        columns.push_if_some("command", payload.command.as_deref());
+        columns.push_if_some("args", payload.args.as_deref());
+        columns.push_if_some("extra_err_file", payload.extra_err_file.as_deref());
+        columns.push_if_some(
+            "external_config_file",
+            payload.external_config_file.as_deref(),
+        );
+        columns.push_if_some("pre_condition", payload.pre_condition.as_deref());
+        columns.push_if_some("timeout", payload.timeout);
+        columns.push_if_some("extra_output_file", payload.extra_output_file.as_deref());
+        columns.push_if_some(
+            "supported_platforms",
+            payload.supported_platforms.if_non_empty(),
+        );
+        columns.push_if_some("verified", payload.verified);
+        columns.push_if_some("custom_tags", payload.custom_tags.if_non_empty());
+        columns.push_if_some("components", payload.components.if_non_empty());
+        columns.push_if_some("is_enabled", payload.is_enabled);
+        columns
     }
 }
 
