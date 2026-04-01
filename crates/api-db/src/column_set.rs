@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use sqlx::{Postgres, QueryBuilder};
 
 #[derive(Default)]
@@ -209,14 +211,20 @@ pub enum ColumnWrap {
 
 pub enum ColumnKind<'a> {
     Bool(bool),
-    String(&'a str),
+    String(Cow<'a, str>),
     Strings(&'a Vec<String>),
     I64(i64),
 }
 
 impl<'a> From<&'a str> for ColumnKind<'a> {
     fn from(value: &'a str) -> Self {
-        Self::String(value)
+        Self::String(Cow::Borrowed(value))
+    }
+}
+
+impl<'a> From<String> for ColumnKind<'a> {
+    fn from(value: String) -> Self {
+        Self::String(Cow::Owned(value))
     }
 }
 

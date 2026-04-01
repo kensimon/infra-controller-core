@@ -31,24 +31,6 @@ use crate::{DatabaseError, DatabaseResult};
 
 const MVT_TABLE: &str = "machine_validation_tests";
 
-impl<'a> From<&'a MachineValidationTestsGetRequest> for ColumnSet<'a> {
-    fn from(req: &'a MachineValidationTestsGetRequest) -> Self {
-        let mut column_set = ColumnSet::new();
-        column_set.push_wrapped_if_some("test_id", req.test_id.as_deref(), ColumnWrap::ToLower);
-        column_set.push_if_some("version", req.version.as_deref());
-        column_set.push_if_some("is_enabled", req.is_enabled);
-        column_set.push_if_some("verified", req.verified);
-        column_set.push_if_some("read_only", req.read_only);
-        column_set.push_if_some(
-            "supported_platforms",
-            req.supported_platforms.if_non_empty(),
-        );
-        column_set.push_if_some("contexts", req.contexts.if_non_empty());
-        column_set.push_if_some("custom_tags", req.custom_tags.if_non_empty());
-        column_set
-    }
-}
-
 pub async fn find(
     txn: impl DbReader<'_>,
     req: MachineValidationTestsGetRequest,
@@ -76,43 +58,10 @@ pub async fn save(
     mut req: MachineValidationTestAddRequest,
     version: ConfigVersion,
 ) -> DatabaseResult<String> {
-    let test_id = generate_test_id(&req.name);
-
-    let re = Regex::new(r"[ =;:@#\!?\-]").unwrap();
-    req.supported_platforms = req
-        .supported_platforms
-        .iter()
-        .map(|p| re.replace_all(p, "_").to_string().to_ascii_lowercase())
-        .collect();
-    let version_string = version.version_string();
-
-    let mut cols = ColumnSet::default();
-    cols.push("name", req.name.as_str());
-    cols.push("command", req.command.as_str());
-    cols.push("args", req.args.as_str());
-    cols.push("version", version_string.as_str());
-    cols.push("test_id", test_id.as_str());
-    cols.push("modified_by", "User");
-
-    cols.push_if_some("description", req.description.as_deref());
-    cols.push_if_some("contexts", req.contexts.if_non_empty());
-    cols.push_if_some("img_name", req.img_name.as_deref());
-    cols.push_if_some("execute_in_host", req.execute_in_host);
-    cols.push_if_some("container_arg", req.container_arg.as_deref());
-    cols.push_if_some("extra_err_file", req.extra_err_file.as_deref());
-    cols.push_if_some("external_config_file", req.external_config_file.as_deref());
-    cols.push_if_some("pre_condition", req.pre_condition.as_deref());
-    cols.push_if_some("timeout", req.timeout);
-    cols.push_if_some("extra_output_file", req.extra_output_file.as_deref());
-    cols.push_if_some(
-        "supported_platforms",
-        req.supported_platforms.if_non_empty(),
-    );
-    cols.push_if_some("read_only", req.read_only);
-    cols.push_if_some("custom_tags", req.custom_tags.if_non_empty());
-    cols.push_if_some("components", req.components.if_non_empty());
-    cols.push_if_some("is_enabled", req.is_enabled);
-
+    let cols = ColumnSet::from(WithVersion {
+        version,
+        value: &mut req,
+    });
     let mut qb = QueryBuilder::new("INSERT INTO ");
     qb.push(MVT_TABLE);
     qb.push_values_for_insert(cols);
@@ -124,8 +73,7 @@ pub async fn save(
         .fetch_one(&mut *txn)
         .await
         .map_err(|e| DatabaseError::query(sql, e))?;
-    debug_assert_eq!(returned, test_id);
-    Ok(test_id)
+    Ok(returned)
 }
 
 /// UPDATE: at least one non-verified field or explicit `verified` must be present, or
@@ -263,6 +211,75 @@ pub async fn enable_disable(
         }),
     };
     update(txn, req).await
+}
+
+impl<'a> From<&'a MachineValidationTestsGetRequest> for ColumnSet<'a> {
+    fn from(req: &'a MachineValidationTestsGetRequest) -> Self {
+        let mut column_set = ColumnSet::new();
+        column_set.push_wrapped_if_some("test_id", req.test_id.as_deref(), ColumnWrap::ToLower);
+        column_set.push_if_some("version", req.version.as_deref());
+        column_set.push_if_some("is_enabled", req.is_enabled);
+        column_set.push_if_some("verified", req.verified);
+        column_set.push_if_some("read_only", req.read_only);
+        column_set.push_if_some(
+            "supported_platforms",
+            req.supported_platforms.if_non_empty(),
+        );
+        column_set.push_if_some("contexts", req.contexts.if_non_empty());
+        column_set.push_if_some("custom_tags", req.custom_tags.if_non_empty());
+        column_set
+    }
+}
+
+struct WithVersion<'a, T> {
+    version: ConfigVersion,
+    value: &'a mut T,
+}
+
+impl<'a> From<WithVersion<'a, MachineValidationTestAddRequest>> for ColumnSet<'a> {
+    fn from(value: WithVersion<'a, MachineValidationTestAddRequest>) -> Self {
+        let WithVersion {
+            version,
+            value: req,
+        } = value;
+        let test_id = generate_test_id(&req.name);
+
+        let re = Regex::new(r"[ =;:@#\!?\-]").unwrap();
+        req.supported_platforms = req
+            .supported_platforms
+            .iter()
+            .map(|p| re.replace_all(p, "_").to_string().to_ascii_lowercase())
+            .collect();
+        let version_string = version.version_string();
+
+        let mut cols = ColumnSet::default();
+        cols.push("name", req.name.as_str());
+        cols.push("command", req.command.as_str());
+        cols.push("args", req.args.as_str());
+        cols.push("version", version_string);
+        cols.push("test_id", test_id);
+        cols.push("modified_by", "User");
+
+        cols.push_if_some("description", req.description.as_deref());
+        cols.push_if_some("contexts", req.contexts.if_non_empty());
+        cols.push_if_some("img_name", req.img_name.as_deref());
+        cols.push_if_some("execute_in_host", req.execute_in_host);
+        cols.push_if_some("container_arg", req.container_arg.as_deref());
+        cols.push_if_some("extra_err_file", req.extra_err_file.as_deref());
+        cols.push_if_some("external_config_file", req.external_config_file.as_deref());
+        cols.push_if_some("pre_condition", req.pre_condition.as_deref());
+        cols.push_if_some("timeout", req.timeout);
+        cols.push_if_some("extra_output_file", req.extra_output_file.as_deref());
+        cols.push_if_some(
+            "supported_platforms",
+            req.supported_platforms.if_non_empty(),
+        );
+        cols.push_if_some("read_only", req.read_only);
+        cols.push_if_some("custom_tags", req.custom_tags.if_non_empty());
+        cols.push_if_some("components", req.components.if_non_empty());
+        cols.push_if_some("is_enabled", req.is_enabled);
+        cols
+    }
 }
 
 #[cfg(test)]
