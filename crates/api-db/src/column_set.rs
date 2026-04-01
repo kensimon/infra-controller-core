@@ -127,27 +127,29 @@ pub trait PushValuesForUpdate<'a> {
 impl<'a> PushValuesForUpdate<'a> for QueryBuilder<'a, Postgres> {
     fn push_values_for_update(&mut self, column_set: ColumnSet<'a>) -> &mut Self {
         self.push(" SET ");
-        let mut sets = self.separated(", ");
+        let mut iter = column_set.set.into_iter().peekable();
 
-        for (column, value) in column_set.set {
-            sets.push_unseparated(column);
-            sets.push_unseparated(" = ");
+        while let Some((column, value)) = iter.next() {
+            self.push(format_args!("{column} = "));
             match value.kind {
                 ColumnKind::Bool(v) => {
-                    sets.push_bind(v);
+                    self.push_bind(v);
                 }
                 ColumnKind::String(v) => {
-                    sets.push_bind(v);
+                    self.push_bind(v);
                 }
                 ColumnKind::Strings(Cow::Borrowed(v)) => {
-                    sets.push_bind(v);
+                    self.push_bind(v);
                 }
                 ColumnKind::Strings(Cow::Owned(v)) => {
-                    sets.push_bind(v);
+                    self.push_bind(v);
                 }
                 ColumnKind::I64(v) => {
-                    sets.push_bind(v);
+                    self.push_bind(v);
                 }
+            }
+            if iter.peek().is_some() {
+                self.push(", ");
             }
         }
 

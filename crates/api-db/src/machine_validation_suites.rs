@@ -350,7 +350,7 @@ mod tests {
             .build()
             .sql();
         assert!(
-            sql.contains("WHERE 1=1"),
+            !sql.contains(" WHERE "),
             "Empty request should have no extra filters, got: {sql}"
         );
         assert!(
