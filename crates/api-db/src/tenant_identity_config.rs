@@ -100,11 +100,11 @@ pub async fn set(
 
     sqlx::query_as(query)
         .bind(org_id.as_str())
-        .bind(&config.issuer)
+        .bind(config.issuer.as_str())
         .bind(&config.default_audience)
         .bind(Json(allowed))
         .bind(token_ttl_i32)
-        .bind(&config.subject_prefix)
+        .bind(config.subject_prefix.as_str())
         .bind(config.enabled)
         .bind(&encrypted_key)
         .bind(&public_key)
@@ -206,7 +206,8 @@ mod tests {
     use forge_secrets::key_encryption;
     use model::metadata::Metadata;
     use model::tenant::{
-        IdentityConfig, TokenDelegation, TokenDelegationAuthMethod, TokenDelegationAuthMethodConfig,
+        IdentityConfig, TokenDelegation, TokenDelegationAuthMethod,
+        TokenDelegationAuthMethodConfig, ValidatedIssuer, ValidatedSubjectPrefix,
     };
 
     use super::*;
@@ -242,13 +243,18 @@ mod tests {
         let mut txn = pool.begin().await.unwrap();
         let org_id = test_org_id();
         ensure_tenant(&mut txn, &org_id).await;
+        let issuer = ValidatedIssuer::parse("https://issuer.example.com").unwrap();
 
         let config = IdentityConfig {
-            issuer: "https://issuer.example.com".to_string(),
+            subject_prefix: ValidatedSubjectPrefix::parse(
+                "spiffe://issuer.example.com/org-x",
+                &issuer,
+            )
+            .unwrap(),
+            issuer,
             default_audience: "api".to_string(),
             allowed_audiences: vec!["api".to_string(), "audience2".to_string()],
             token_ttl_sec: 3600,
-            subject_prefix: "spiffe://issuer.example.com/org-x".to_string(),
             enabled: true,
             rotate_key: false,
             algorithm: "ES256".to_string(),
@@ -296,13 +302,15 @@ mod tests {
         let mut txn = pool.begin().await.unwrap();
         let org_id = test_org_id();
         ensure_tenant(&mut txn, &org_id).await;
+        let issuer = ValidatedIssuer::parse("https://issuer.example.com").unwrap();
 
         let config = IdentityConfig {
-            issuer: "https://issuer.example.com".to_string(),
+            subject_prefix: ValidatedSubjectPrefix::parse("spiffe://issuer.example.com", &issuer)
+                .unwrap(),
+            issuer,
             default_audience: "api".to_string(),
             allowed_audiences: vec!["api".to_string()],
             token_ttl_sec: 3600,
-            subject_prefix: "spiffe://issuer.example.com".to_string(),
             enabled: true,
             rotate_key: false,
             algorithm: "ES256".to_string(),

@@ -32,6 +32,8 @@
 //! - **key_id**: map key under `machine_identity.encryption_keys` (e.g. `kv1`), must match site
 //!   `current_encryption_key_id` (from a secrets file, env-backed credentials, or another store).
 
+use std::borrow::Cow;
+
 use aes_gcm::Aes256Gcm;
 use aes_gcm::aead::{Aead, KeyInit};
 use base64::Engine;
@@ -59,6 +61,10 @@ pub enum KeyEncryptionError {
     Encrypt(String),
     #[error("decryption failed: {0}")]
     Decrypt(String),
+    #[error("serialization failed: {0}")]
+    Serde(#[from] serde_json::Error),
+    #[error("decryption failed: {0}")]
+    Base64(#[from] base64::DecodeError),
 }
 
 /// Decodes machine-identity encryption key material from its **stored** form: standard base64 of
@@ -66,9 +72,7 @@ pub enum KeyEncryptionError {
 /// should use those directly as [`Aes256Key`].
 pub fn aes256_key_from_stored_secret(stored: &str) -> Result<Aes256Key, KeyEncryptionError> {
     let trimmed = stored.trim();
-    let raw = BASE64.decode(trimmed).map_err(|e| {
-        KeyEncryptionError::Encrypt(format!("encryption secret is not valid base64: {e}"))
-    })?;
+    let raw = BASE64.decode(trimmed)?;
     raw.try_into().map_err(|v: Vec<u8>| {
         KeyEncryptionError::Encrypt(format!(
             "encryption secret must decode to exactly 32 bytes for AES-256 (got {} bytes); use e.g. `openssl rand -base64 32`",
@@ -79,42 +83,46 @@ pub fn aes256_key_from_stored_secret(stored: &str) -> Result<Aes256Key, KeyEncry
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct EncryptionEnvelopeV1 {
+struct EncryptionEnvelopeV1<'a> {
     scheme_version: u8,
-    key_id: String,
-    nonce: [u8; 12],
-    ciphertext: Vec<u8>,
+    key_id: Cow<'a, str>,
+    nonce: Cow<'a, [u8; 12]>,
+    ciphertext: Cow<'a, [u8]>,
 }
 
-fn envelope_json_bytes(
-    key_id: &str,
-    nonce: &[u8; 12],
-    ciphertext: &[u8],
-) -> Result<Vec<u8>, KeyEncryptionError> {
-    let kid = key_id.as_bytes();
-    if kid.is_empty() || kid.len() > 255 {
-        return Err(KeyEncryptionError::Encrypt(
-            "encryption_key_id (envelope) must be 1..=255 UTF-8 bytes".into(),
-        ));
+impl<'a> EncryptionEnvelopeV1<'a> {
+    fn new(
+        key_id: &'a str,
+        nonce: &'a [u8; 12],
+        ciphertext: &'a [u8],
+    ) -> Result<Self, KeyEncryptionError> {
+        if key_id.is_empty() || key_id.len() > 255 {
+            return Err(KeyEncryptionError::Encrypt(
+                "encryption_key_id (envelope) must be 1..=255 UTF-8 bytes".into(),
+            ));
+        }
+        Ok(EncryptionEnvelopeV1 {
+            scheme_version: SCHEME_VERSION_V1,
+            key_id: Cow::Borrowed(key_id),
+            nonce: Cow::Borrowed(nonce),
+            ciphertext: Cow::Borrowed(ciphertext),
+        })
     }
-    let env = EncryptionEnvelopeV1 {
-        scheme_version: SCHEME_VERSION_V1,
-        key_id: key_id.to_string(),
-        nonce: *nonce,
-        ciphertext: ciphertext.to_vec(),
-    };
-    serde_json::to_vec(&env).map_err(|e| KeyEncryptionError::Encrypt(e.to_string()))
-}
 
-fn parse_envelope_json(data: &[u8]) -> Result<([u8; 12], Vec<u8>), KeyEncryptionError> {
-    let env: EncryptionEnvelopeV1 =
-        serde_json::from_slice(data).map_err(|e| KeyEncryptionError::Decrypt(e.to_string()))?;
-    if env.scheme_version != SCHEME_VERSION_V1 {
-        return Err(KeyEncryptionError::Decrypt(
-            "unsupported scheme_version".into(),
-        ));
+    fn from_encrypted_base64(base64: &str) -> Result<Self, KeyEncryptionError> {
+        let data = BASE64.decode(base64.trim())?;
+        let env: EncryptionEnvelopeV1 = serde_json::from_slice(&data)?;
+        if env.scheme_version != SCHEME_VERSION_V1 {
+            return Err(KeyEncryptionError::Decrypt(
+                "unsupported scheme_version".into(),
+            ));
+        }
+        Ok(env)
     }
-    Ok((env.nonce, env.ciphertext))
+
+    fn to_encrypted_base64(&self) -> Result<String, KeyEncryptionError> {
+        Ok(BASE64.encode(serde_json::to_vec(&self)?))
+    }
 }
 
 /// Encrypts plaintext with AES-256-GCM using envelope v1.
@@ -128,8 +136,7 @@ pub fn encrypt(
     encryption_secret: &Aes256Key,
     encryption_key_id: &str,
 ) -> Result<String, KeyEncryptionError> {
-    let cipher = Aes256Gcm::new_from_slice(encryption_secret)
-        .map_err(|e| KeyEncryptionError::Encrypt(e.to_string()))?;
+    let cipher = Aes256Gcm::new(encryption_secret.into());
     let mut nonce = [0u8; 12];
     AesOsRng.try_fill_bytes(&mut nonce).map_err(|e| {
         KeyEncryptionError::Encrypt(format!("OS RNG failed while generating AES-GCM nonce: {e}"))
@@ -137,8 +144,7 @@ pub fn encrypt(
     let ciphertext = cipher
         .encrypt(&nonce.into(), plaintext)
         .map_err(|e| KeyEncryptionError::Encrypt(e.to_string()))?;
-    let envelope = envelope_json_bytes(encryption_key_id, &nonce, &ciphertext)?;
-    Ok(BASE64.encode(&envelope))
+    EncryptionEnvelopeV1::new(encryption_key_id, &nonce, &ciphertext)?.to_encrypted_base64()
 }
 
 /// Decrypts a DB value produced by [`encrypt`]: JSON envelope v1, same [`Aes256Key`] as used for encrypt.
@@ -146,16 +152,9 @@ pub fn decrypt(
     encrypted_base64: &str,
     encryption_secret: &Aes256Key,
 ) -> Result<Vec<u8>, KeyEncryptionError> {
-    let combined = BASE64
-        .decode(encrypted_base64.trim())
-        .map_err(|e| KeyEncryptionError::Decrypt(e.to_string()))?;
-
-    let (nonce, ciphertext) = parse_envelope_json(&combined)?;
-    let cipher = Aes256Gcm::new_from_slice(encryption_secret)
-        .map_err(|e| KeyEncryptionError::Decrypt(e.to_string()))?;
-    let nonce_ga = aes_gcm::aead::generic_array::GenericArray::from_slice(&nonce);
-    cipher
-        .decrypt(nonce_ga, ciphertext.as_slice())
+    let envelope = EncryptionEnvelopeV1::from_encrypted_base64(encrypted_base64)?;
+    Aes256Gcm::new(encryption_secret.into())
+        .decrypt(envelope.nonce.as_ref().into(), envelope.ciphertext.as_ref())
         .map_err(|e| KeyEncryptionError::Decrypt(e.to_string()))
 }
 

@@ -248,9 +248,7 @@ pub(crate) async fn set_identity_configuration(
         .ok_or_else(|| CarbideError::InvalidArgument("IdentityConfig is required".to_string()))?;
     let config = IdentityConfig::try_from_proto(
         proto,
-        &model::tenant::IdentityConfigValidationBounds::from(
-            api.runtime_config.machine_identity.clone(),
-        ),
+        &model::tenant::IdentityConfigValidationBounds::from(&api.runtime_config.machine_identity),
     )
     .map_err(|e: IdentityConfigValidationError| CarbideError::InvalidArgument(e.0))?;
     let org_id = req.organization_id.trim();
@@ -406,7 +404,7 @@ pub(crate) async fn set_token_delegation(
         .and_then(|c| {
             TokenDelegation::try_from_proto(
                 c.clone(),
-                &TokenDelegationValidationBounds::from(api.runtime_config.machine_identity.clone()),
+                &TokenDelegationValidationBounds::from(&api.runtime_config.machine_identity),
             )
             .map_err(|e: TokenDelegationValidationError| CarbideError::InvalidArgument(e.0))
         })?;

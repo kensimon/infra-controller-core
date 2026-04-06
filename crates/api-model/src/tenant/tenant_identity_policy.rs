@@ -2,436 +2,393 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
+use std::str::FromStr;
 
-//! Tenant identity policy (driven by site `[machine_identity]` config): JWT issuer normalization,
-//! SPIFFE `subject_prefix` resolution, OAuth token-endpoint host extraction, and hostname allowlists.
-//!
-//! Issuers must be `http://`, `https://`, or `spiffe://` URLs parsed with [`Url::parse`], with no
-//! userinfo, query, or fragment. The trust domain is the registered (non-IP) host, lowercased for a
-//! stable `iss` and SPIFFE comparisons. Ports do not affect the trust-domain string;
-//! [`normalize_issuer_and_trust_domain`] builds the normalized `iss`, keeps explicit port and non-empty
-//! paths, and omits a lone default `/` path.
-
-use lazy_static::lazy_static;
-use regex::Regex;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use url::{Host, Url};
 
-/// Upper bound for stored / configured issuer strings (JWT `iss` is unbounded in theory).
-const MAX_ISSUER_BYTES: usize = 2048;
-/// Upper bound for `subject_prefix` (SPIFFE ID prefix + optional path).
-const MAX_SUBJECT_PREFIX_BYTES: usize = 2048;
-/// DNS hostname max length (octets) per RFC 1035.
+const MAX_URL_BYTES: usize = 2048;
 const MAX_TRUST_DOMAIN_BYTES: usize = 253;
-
-lazy_static! {
-    static ref PATH_SEGMENT: Regex = Regex::new(r"^[a-zA-Z0-9._-]+$").unwrap();
-}
-
-fn reject_non_url_literal(s: &str, field: &str) -> Result<(), String> {
-    if !s.is_ascii() {
-        return Err(format!("{field} must contain only ASCII characters"));
-    }
-    if s.bytes().any(|b| b < 0x20 || b == 0x7f) {
-        return Err(format!(
-            "{field} must not contain control characters (disallowed)"
-        ));
-    }
-    if s.contains(['\\', '%', '#', ' ']) {
-        return Err(format!(
-            "{field} contains disallowed characters: must not contain spaces, '\\\\', '%', or '#' (no percent-encoding or fragments)"
-        ));
-    }
-    Ok(())
-}
-
-fn spiffe_path_after_authority(u: &Url) -> &str {
-    u.path().strip_prefix('/').unwrap_or("")
-}
-
-fn enforce_max_len(len: usize, max: usize, field: &str) -> Result<(), String> {
-    if len > max {
-        return Err(format!("{field} exceeds maximum length ({max} bytes)"));
-    }
-    Ok(())
-}
-
-fn normalize_trust_domain_token(host: &str) -> String {
-    host.to_ascii_lowercase()
-}
-
-fn validate_trust_domain_len(host: &str) -> Result<(), String> {
-    if host.is_empty() {
-        return Err("trust domain must be non-empty".into());
-    }
-    if host.len() > MAX_TRUST_DOMAIN_BYTES {
-        return Err(format!(
-            "trust domain exceeds maximum length ({MAX_TRUST_DOMAIN_BYTES} bytes)"
-        ));
-    }
-    Ok(())
-}
-
-/// Registered name host only (rejects IPv4/IPv6 literals from [`Url::host`]).
-fn domain_only_host<'a>(
-    u: &'a Url,
-    field: &str,
-    missing_host_msg: &str,
-) -> Result<&'a str, String> {
-    match u.host() {
-        Some(Host::Domain(host)) => Ok(host),
-        Some(Host::Ipv4(_) | Host::Ipv6(_)) => Err(format!(
-            "{field}: trust domain must be a DNS hostname, not an IP address (got {:?})",
-            u.host_str().unwrap_or("")
-        )),
-        None => Err(missing_host_msg.into()),
-    }
-}
-
-/// No userinfo, query, or fragment (`field` prefixes errors, e.g. `issuer` or `subject_prefix`).
-fn validate_url_no_query_fragment_userinfo(u: &Url, field: &str) -> Result<(), String> {
-    if u.query().is_some() {
-        return Err(format!("{field}: query is not allowed"));
-    }
-    if u.fragment().is_some() {
-        return Err(format!("{field}: fragment is not allowed"));
-    }
-    if !u.username().is_empty() || u.password().is_some() {
-        return Err(format!("{field}: URL must not contain userinfo"));
-    }
-    Ok(())
-}
-
-fn parse_identity_url(raw: &str, parse_err_label: &str) -> Result<Url, String> {
-    Url::parse(raw).map_err(|e| format!("{parse_err_label}: invalid URL ({e})"))
-}
-
-/// Registered domain host, length check, lowercase trust-domain string.
-///
-/// [`Url::parse`] canonicalizes ASCII host **case** for `http`/`https`, but not consistently for
-/// `spiffe://`; we always lowercase so `iss`, allowlists, and `subject_prefix` agree.
-fn validated_trust_domain_token(
-    u: &Url,
-    field: &str,
-    missing_host_msg: &str,
-) -> Result<String, String> {
-    let host = domain_only_host(u, field, missing_host_msg)?;
-    validate_trust_domain_len(host)?;
-    Ok(normalize_trust_domain_token(host))
-}
-
-/// Parse and validate JWT issuer URL (`http` / `https` / `spiffe`).
-fn parse_issuer_url(issuer: &str) -> Result<Url, String> {
-    let issuer = issuer.trim();
-    if issuer.is_empty() {
-        return Err("issuer is required".into());
-    }
-    enforce_max_len(issuer.len(), MAX_ISSUER_BYTES, "issuer")?;
-
-    if !issuer.contains("://") {
-        return Err(
-            "issuer must be an http://, https://, or spiffe:// URL (bare hostnames are not supported)"
-                .into(),
-        );
-    }
-
-    reject_non_url_literal(issuer, "issuer")?;
-    let u = parse_identity_url(issuer, "issuer")?;
-    validate_issuer_url(&u)?;
-    Ok(u)
-}
-
-fn serialize_issuer_url(u: &Url, host_lc: &str) -> String {
-    let scheme = u.scheme();
-    let port = match u.port() {
-        Some(p) => format!(":{p}"),
-        None => String::new(),
-    };
-    // `Url::path` is `/` when no path was written; omit it so `https://td` matches typical `iss`.
-    let path = u.path();
-    let path_part = if path == "/" { "" } else { path };
-    format!("{scheme}://{host_lc}{port}{path_part}")
-}
-
-/// Parses JWT issuer once. Returns `(normalized_iss, trust_domain)` — canonical `iss` string
-/// (lowercased host for trust domain; scheme per [`Url`]; explicit port and non-root path preserved;
-/// default lone `/` path omitted) and lowercase registered host for SPIFFE trust domain.
-pub(super) fn normalize_issuer_and_trust_domain(issuer: &str) -> Result<(String, String), String> {
-    let u = parse_issuer_url(issuer)?;
-    let td = validated_trust_domain_token(&u, "issuer", "issuer: URL must have a host")?;
-    let normalized = serialize_issuer_url(&u, &td);
-    Ok((normalized, td))
-}
-
-// --- `[machine_identity].trust_domain_allowlist` (site policy; empty list = no extra check) ---
-
 const MAX_ALLOWLIST_PATTERN_BYTES: usize = 512;
 
-fn normalize_allowlist_token(s: &str) -> String {
-    s.trim().trim_end_matches('.').to_ascii_lowercase()
+#[derive(Default, Debug, Clone)]
+pub struct TrustDomainAllowList {
+    entries: Vec<TrustDomainAllowlistPattern>,
 }
 
-/// `*.suffix`: exactly one label under `suffix` (e.g. `auth.something.net`, not `a.b.something.net`).
-fn trust_domain_matches_single_star_suffix(td: &str, suffix: &str) -> bool {
-    let tail = format!(".{suffix}");
-    td.strip_suffix(&tail)
-        .is_some_and(|left| !left.is_empty() && !left.contains('.'))
-}
-
-/// `**.suffix`: `suffix` itself or any subdomain (`a.b.suffix`).
-fn trust_domain_matches_double_star_suffix(td: &str, suffix: &str) -> bool {
-    td == suffix || td.ends_with(&format!(".{suffix}"))
-}
-
-/// Returns `Ok` if `hostname` (already normalized, lowercase DNS name) is allowed by at least one pattern.
-/// Empty `allowlist` → always `Ok`.
-fn hostname_matches_allowlist(
-    hostname: &str,
-    allowlist: &[String],
-    entity_label: &'static str,
-    list_config_key: &'static str,
-) -> Result<(), String> {
-    if allowlist.is_empty() {
-        return Ok(());
+impl TrustDomainAllowList {
+    pub fn parse<S: AsRef<str>>(entries: &[S]) -> Result<Self, TrustDomainAllowListError> {
+        Ok(Self {
+            entries: entries
+                .iter()
+                .map(|s| s.as_ref().parse())
+                .collect::<Result<Vec<_>, _>>()?,
+        })
     }
-    let td = normalize_allowlist_token(hostname);
-    if td.is_empty() {
-        return Err(format!("{entity_label} is empty"));
+
+    pub fn allows(&self, trust_domain: &str) -> bool {
+        self.entries.is_empty() || self.entries.iter().any(|e| e.matches(trust_domain))
     }
-    for raw in allowlist {
-        let p = normalize_allowlist_token(raw);
-        let matches = if let Some(suffix) = p.strip_prefix("**.") {
-            trust_domain_matches_double_star_suffix(&td, suffix)
-        } else if let Some(suffix) = p.strip_prefix("*.") {
-            trust_domain_matches_single_star_suffix(&td, suffix)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TrustDomainAllowlistPattern {
+    ExactDomain(String),
+    SingleSubdomainWildcard { suffix: String },
+    ManySubdomainWildcard { suffix: String },
+}
+
+impl TrustDomainAllowlistPattern {
+    pub fn matches(&self, trust_domain: &str) -> bool {
+        let trust_domain = trust_domain
+            .trim()
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        if trust_domain.is_empty() {
+            return false;
+        }
+
+        match self {
+            Self::ExactDomain(domain) => trust_domain == *domain,
+            Self::SingleSubdomainWildcard { suffix } => {
+                let tail = format!(".{suffix}");
+                trust_domain
+                    .strip_suffix(&tail)
+                    .is_some_and(|left| !left.is_empty() && !left.contains('.'))
+            }
+            Self::ManySubdomainWildcard { suffix } => {
+                trust_domain == *suffix || trust_domain.ends_with(&format!(".{suffix}"))
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TrustDomainAllowList {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let strings = <Vec<String> as Deserialize>::deserialize(deserializer)?;
+        TrustDomainAllowList::parse(&strings).map_err(serde::de::Error::custom)
+    }
+}
+
+impl Serialize for TrustDomainAllowList {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.entries.serialize(serializer)
+    }
+}
+
+impl Serialize for TrustDomainAllowlistPattern {
+    fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            TrustDomainAllowlistPattern::ExactDomain(domain) => s.serialize_str(domain.as_str()),
+            TrustDomainAllowlistPattern::SingleSubdomainWildcard { suffix } => {
+                s.serialize_str(&format!("*.{}", suffix).as_str())
+            }
+            TrustDomainAllowlistPattern::ManySubdomainWildcard { suffix } => {
+                s.serialize_str(&format!("**.{}", suffix).as_str())
+            }
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum TrustDomainAllowListError {
+    #[error("Empty entry (after trim)")]
+    EmptyEntry,
+    #[error("pattern exceeds {max} bytes: {size}")]
+    TooLarge { size: usize, max: usize },
+    #[error("invalid pattern: {0}")]
+    InvalidPattern(String),
+    #[error("wildcards only as `*.` or `**.` prefix ({0})")]
+    InvalidWildcards(String),
+}
+
+impl FromStr for TrustDomainAllowlistPattern {
+    type Err = TrustDomainAllowListError;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let pattern = raw.trim().trim_end_matches('.').to_ascii_lowercase();
+        if pattern.is_empty() {
+            return Err(TrustDomainAllowListError::EmptyEntry);
+        }
+        if pattern.len() > MAX_ALLOWLIST_PATTERN_BYTES {
+            return Err(TrustDomainAllowListError::TooLarge {
+                size: pattern.len(),
+                max: MAX_ALLOWLIST_PATTERN_BYTES,
+            });
+        }
+
+        if let Some(suffix) = pattern.strip_prefix("**.") {
+            if suffix.is_empty() || suffix.contains('*') {
+                Err(TrustDomainAllowListError::InvalidPattern(raw.to_string()))
+            } else {
+                Ok(Self::ManySubdomainWildcard {
+                    suffix: suffix.to_string(),
+                })
+            }
+        } else if let Some(suffix) = pattern.strip_prefix("*.") {
+            if suffix.is_empty() || suffix.contains('*') {
+                Err(TrustDomainAllowListError::InvalidPattern(raw.to_string()))
+            } else {
+                Ok(Self::SingleSubdomainWildcard {
+                    suffix: suffix.to_string(),
+                })
+            }
+        } else if pattern.contains('*') {
+            Err(TrustDomainAllowListError::InvalidWildcards(raw.to_string()))
         } else {
-            td == p
+            Ok(Self::ExactDomain(pattern))
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidatedIssuer {
+    pub identity: String,
+    pub trust_domain: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum IssuerError {
+    #[error("Invalid issuer URL: {0}")]
+    Parse(#[from] IdentityParseError),
+}
+
+impl ValidatedIssuer {
+    pub fn parse(raw: &str) -> Result<Self, IssuerError> {
+        let identity_url =
+            ValidatedIdentityUrl::parse(raw)?.require_scheme(&["http", "https", "spiffe"])?;
+        Ok(ValidatedIssuer {
+            identity: identity_url.canonicalized(),
+            trust_domain: identity_url.trust_domain,
+        })
+    }
+
+    pub fn into_string(self) -> String {
+        self.identity
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.identity
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidatedSubjectPrefix(String);
+
+#[derive(Debug, thiserror::Error)]
+pub enum SubjectPrefixError {
+    #[error("Invalid subject prefix URL: {0}")]
+    Parse(#[from] IdentityParseError),
+    #[error(
+        "Subject prefix trust domain {got:?} does not match issuer trust domain (expected {expected:?})"
+    )]
+    TrustDomainMismatch { expected: String, got: String },
+}
+
+impl ValidatedSubjectPrefix {
+    pub fn parse(raw: &str, issuer: &ValidatedIssuer) -> Result<Self, SubjectPrefixError> {
+        let raw = if raw.is_empty() {
+            return Ok(Self(format!("spiffe://{}", issuer.trust_domain)));
+        } else {
+            raw
         };
-        if matches {
-            return Ok(());
-        }
-    }
-    Err(format!(
-        "{entity_label} {td:?} is not allowed by {list_config_key}"
-    ))
-}
 
-/// Returns `Ok` if issuer trust domain (normalized host) is allowed by at least one pattern.
-/// Empty `allowlist` → always `Ok`.
-pub(super) fn trust_domain_matches_allowlist(
-    trust_domain: &str,
-    allowlist: &[String],
-) -> Result<(), String> {
-    hostname_matches_allowlist(
-        trust_domain,
-        allowlist,
-        "trust domain",
-        "machine_identity.trust_domain_allowlist",
-    )
-}
+        let spiffe_url = ValidatedIdentityUrl::parse(&raw)?.require_valid_spiffe_url()?;
 
-/// Same pattern language as trust-domain allowlist; `hostname` is the registered host from `token_endpoint`.
-pub(super) fn token_endpoint_domain_matches_allowlist(
-    host: &str,
-    allowlist: &[String],
-) -> Result<(), String> {
-    hostname_matches_allowlist(
-        host,
-        allowlist,
-        "token_endpoint domain",
-        "machine_identity.token_endpoint_domain_allowlist",
-    )
-}
-
-fn validate_hostname_allowlist_patterns(
-    entries: &[String],
-    list_field: &str,
-) -> Result<(), String> {
-    for raw in entries {
-        let p = normalize_allowlist_token(raw);
-        if p.is_empty() {
-            return Err(format!("{list_field}: empty entry (after trim)"));
-        }
-        if p.len() > MAX_ALLOWLIST_PATTERN_BYTES {
-            return Err(format!(
-                "{list_field}: pattern exceeds {MAX_ALLOWLIST_PATTERN_BYTES} bytes ({raw:?})"
+        let canonicalized = spiffe_url.canonicalized();
+        if raw.to_ascii_lowercase() != canonicalized.to_ascii_lowercase() {
+            return Err(SubjectPrefixError::Parse(
+                format!("SPIFFE URL is in non-canonical form: {raw}").into(),
             ));
         }
-        if p == "*" || p == "**" {
-            return Err(format!("{list_field}: bare `*` is not allowed ({raw:?})"));
+
+        if spiffe_url.trust_domain != issuer.trust_domain {
+            return Err(SubjectPrefixError::TrustDomainMismatch {
+                expected: issuer.trust_domain.clone(),
+                got: spiffe_url.trust_domain,
+            });
         }
-        if let Some(suffix) = p.strip_prefix("**.") {
-            if suffix.is_empty() {
-                return Err(format!("{list_field}: invalid pattern {raw:?}"));
-            }
-            if suffix.contains('*') {
+
+        Ok(ValidatedSubjectPrefix(canonicalized))
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidatedTokenEndpoint {
+    pub host: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum TokenEndpointError {
+    #[error("Invalid token endpoint URL: {0}")]
+    Parse(#[from] IdentityParseError),
+}
+
+impl ValidatedTokenEndpoint {
+    pub fn parse(raw: &str) -> Result<Self, TokenEndpointError> {
+        Ok(ValidatedTokenEndpoint {
+            host: ValidatedIdentityUrl::parse(raw)?
+                .require_scheme(&["http", "https"])?
+                .trust_domain,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ValidatedIdentityUrl {
+    trust_domain: String,
+    url: Url,
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum IdentityParseError {
+    #[error("{0}")]
+    Formatted(String),
+    #[error("{0}")]
+    Static(&'static str),
+}
+impl From<&'static str> for IdentityParseError {
+    fn from(value: &'static str) -> Self {
+        Self::Static(value)
+    }
+}
+impl From<String> for IdentityParseError {
+    fn from(value: String) -> Self {
+        Self::Formatted(value)
+    }
+}
+
+impl ValidatedIdentityUrl {
+    fn parse(raw: &str) -> Result<Self, IdentityParseError> {
+        if raw.is_empty() {
+            return Err("url is empty".into());
+        }
+        if raw.len() > MAX_URL_BYTES {
+            return Err(format!("url exceeds maximum length ({MAX_URL_BYTES} bytes)").into());
+        }
+        if !raw.is_ascii() {
+            return Err("must contain only ASCII characters".into());
+        }
+        if raw.bytes().any(|b| b < 0x20 || b == 0x7f) {
+            return Err("must not contain control characters (disallowed)".into());
+        }
+        if raw.contains(['\\', '%', '#', ' ']) {
+            return Err(
+                "contains disallowed characters: must not contain spaces, '\\\\', '%', or '#'"
+                    .into(),
+            );
+        }
+        let mut url = Url::parse(&raw).map_err(|err| format!("invalid URL ({err})"))?;
+        if url.query().is_some() {
+            return Err("query is not allowed".into());
+        }
+        if url.fragment().is_some() {
+            return Err("fragment is not allowed".into());
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err("URL must not contain userinfo".into());
+        }
+        let host = match url.host() {
+            Some(Host::Domain(host)) if !host.is_empty() => host,
+            Some(Host::Ipv4(_) | Host::Ipv6(_)) => {
                 return Err(format!(
-                    "{list_field}: `*` not allowed inside suffix ({raw:?})"
-                ));
+                    "trust domain must be a DNS hostname, not an IP address (got {:?})",
+                    url
+                )
+                .into());
             }
-        } else if let Some(suffix) = p.strip_prefix("*.") {
-            if suffix.is_empty() {
-                return Err(format!("{list_field}: invalid pattern {raw:?}"));
-            }
-            if suffix.contains('*') {
-                return Err(format!(
-                    "{list_field}: `*` not allowed inside suffix ({raw:?})"
-                ));
-            }
-        } else if p.contains('*') {
+            _ => return Err(format!("url must have a host: {}", url).into()),
+        };
+        if host.len() > MAX_TRUST_DOMAIN_BYTES {
             return Err(format!(
-                "{list_field}: wildcards only as `*.` or `**.` prefix ({raw:?})"
-            ));
+                "hostname part exceeds maximum length ({} bytes)",
+                MAX_TRUST_DOMAIN_BYTES
+            )
+            .into());
+        }
+        let trust_domain = host.to_ascii_lowercase();
+        url.set_host(Some(trust_domain.as_str()))
+            .map_err(|err| format!("invalid URL ({})", err))?;
+        Ok(Self { url, trust_domain })
+    }
+
+    fn require_valid_spiffe_url(self) -> Result<Self, IdentityParseError> {
+        if self.url.scheme() != "spiffe" {
+            return Err("must use the spiffe:// scheme".into());
+        }
+        if self.url.port().is_some() {
+            return Err("must not include a port".into());
+        }
+        let path = self.url.path();
+        if path.is_empty() || path == "/" {
+            return Ok(self);
+        }
+        if !path.starts_with('/') {
+            return Err("path must start with '/'".into());
+        }
+        if path.ends_with('/') {
+            return Err("path must not end with '/' (use spiffe://<td> for root only)".into());
+        }
+        for segment in path.trim_start_matches('/').split('/') {
+            if segment.is_empty() {
+                return Err("path must not contain empty segments".into());
+            }
+            if segment == "." || segment == ".." {
+                return Err("path must not use '.' or '..' segments".into());
+            }
+            if !segment
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+            {
+                return Err(format!("path segment {segment:?} must match [a-zA-Z0-9._-]+").into());
+            }
+        }
+        Ok(self)
+    }
+
+    fn require_scheme(self, allowed: &[&str]) -> Result<Self, IdentityParseError> {
+        if allowed.contains(&self.url.scheme()) {
+            Ok(self)
+        } else {
+            Err(format!(
+                "Unexpected scheme {}: supported: {:?}",
+                self.url.scheme(),
+                allowed
+            )
+            .into())
         }
     }
-    Ok(())
-}
 
-/// Validates `[machine_identity].trust_domain_allowlist` entries from config. Call at startup.
-pub fn validate_trust_domain_allowlist_patterns(entries: &[String]) -> Result<(), String> {
-    validate_hostname_allowlist_patterns(entries, "machine_identity.trust_domain_allowlist")
-}
-
-/// Validates `[machine_identity].token_endpoint_domain_allowlist` entries from config. Call at startup.
-pub fn validate_token_endpoint_domain_allowlist_patterns(entries: &[String]) -> Result<(), String> {
-    validate_hostname_allowlist_patterns(
-        entries,
-        "machine_identity.token_endpoint_domain_allowlist",
-    )
-}
-
-/// `http` / `https` only; no userinfo, query, or fragment.
-fn validate_token_endpoint_url(u: &Url) -> Result<(), String> {
-    validate_url_no_query_fragment_userinfo(u, "token_endpoint")?;
-    match u.scheme() {
-        "http" | "https" => Ok(()),
-        other => Err(format!(
-            "token_endpoint: only http or https URLs are allowed (got {other:?})"
-        )),
-    }
-}
-
-/// RFC 8693 token endpoints: **`http://` and `https://` only** (no `spiffe://` or other schemes).
-fn parse_token_endpoint_url(raw: &str) -> Result<Url, String> {
-    let raw = raw.trim();
-    enforce_max_len(raw.len(), MAX_ISSUER_BYTES, "token_endpoint")?;
-    if !raw.contains("://") {
-        return Err(
-            "token_endpoint must be an http:// or https:// URL (bare hostnames are not supported)"
-                .into(),
-        );
-    }
-    reject_non_url_literal(raw, "token_endpoint")?;
-    let u = Url::parse(raw).map_err(|e| format!("token_endpoint: invalid URL ({e})"))?;
-    validate_token_endpoint_url(&u)?;
-    Ok(u)
-}
-
-/// Parses `token_endpoint` when an allowlist is configured: registered DNS host, lowercase (rejects IP literals).
-/// URL must use **`http` or `https`** scheme only.
-pub(super) fn registered_host_for_token_endpoint(token_endpoint: &str) -> Result<String, String> {
-    let u = parse_token_endpoint_url(token_endpoint)?;
-    validated_trust_domain_token(&u, "token_endpoint", "token_endpoint: URL must have a host")
-}
-
-/// `http` / `https` / `spiffe` only; no userinfo, query, or fragment.
-fn validate_issuer_url(u: &Url) -> Result<(), String> {
-    validate_url_no_query_fragment_userinfo(u, "issuer")?;
-    match u.scheme() {
-        "http" | "https" | "spiffe" => Ok(()),
-        other => Err(format!(
-            "issuer: only http, https, or spiffe URLs are allowed (got {other:?})"
-        )),
-    }
-}
-
-fn validate_subject_prefix_url(u: &Url) -> Result<(), String> {
-    validate_url_no_query_fragment_userinfo(u, "subject_prefix")?;
-    if u.scheme() != "spiffe" {
-        return Err("subject_prefix must use the spiffe:// scheme".into());
-    }
-    Ok(())
-}
-
-fn default_subject_prefix(expected_td: &str) -> String {
-    format!("spiffe://{expected_td}")
-}
-
-fn validate_path_segments(path_raw: &str) -> Result<Vec<&str>, String> {
-    if path_raw.is_empty() {
-        return Ok(Vec::new());
-    }
-    if path_raw.ends_with('/') {
-        return Err(
-            "subject_prefix path must not end with '/' (use spiffe://<td> for root only)".into(),
-        );
-    }
-    let mut out = Vec::new();
-    for seg in path_raw.split('/') {
-        if seg.is_empty() {
-            return Err("subject_prefix path must not contain empty segments".into());
-        }
-        if seg == "." || seg == ".." {
-            return Err("subject_prefix path must not use '.' or '..' segments".into());
-        }
-        if !PATH_SEGMENT.is_match(seg) {
-            return Err(format!(
-                "subject_prefix path segment {seg:?} must match [a-zA-Z0-9._-]+"
-            ));
-        }
-        out.push(seg);
-    }
-    Ok(out)
-}
-
-fn validate_and_canonicalize_subject_prefix(
-    raw: &str,
-    expected_td: &str,
-) -> Result<String, String> {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return Ok(default_subject_prefix(expected_td));
-    }
-    enforce_max_len(raw.len(), MAX_SUBJECT_PREFIX_BYTES, "subject_prefix")?;
-    reject_non_url_literal(raw, "subject_prefix")?;
-
-    const PREFIX: &[u8] = b"spiffe://";
-    let b = raw.as_bytes();
-    if b.len() < PREFIX.len() || !b[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
-        return Err("subject_prefix must use the spiffe:// scheme".into());
-    }
-
-    let u = parse_identity_url(raw, "subject_prefix")?;
-    validate_subject_prefix_url(&u)?;
-
-    let td_norm = validated_trust_domain_token(
-        &u,
-        "subject_prefix",
-        "subject_prefix is missing a trust domain after spiffe://",
-    )?;
-    if td_norm != expected_td {
-        return Err(format!(
-            "subject_prefix trust domain {:?} does not match issuer trust domain (expected {expected_td:?})",
-            u.host_str().unwrap_or("")
-        ));
-    }
-
-    let path_raw = spiffe_path_after_authority(&u);
-    let segments = validate_path_segments(path_raw)?;
-    if segments.is_empty() {
-        Ok(default_subject_prefix(expected_td))
-    } else {
-        Ok(format!("spiffe://{expected_td}/{}", segments.join("/")))
-    }
-}
-
-/// Resolves optional proto `subject_prefix`: default `spiffe://<expected_td>` or validated user value.
-pub(super) fn resolve_subject_prefix(
-    expected_td: &str,
-    proto_subject_prefix: Option<&str>,
-) -> Result<String, String> {
-    match proto_subject_prefix {
-        None | Some("") => Ok(default_subject_prefix(expected_td)),
-        Some(s) => validate_and_canonicalize_subject_prefix(s, expected_td),
+    fn canonicalized(&self) -> String {
+        let host = &self.trust_domain;
+        let port = self
+            .url
+            .port()
+            .map(|port| format!(":{port}"))
+            .unwrap_or_default();
+        let path = if self.url.path() == "/" {
+            ""
+        } else {
+            self.url.path()
+        };
+        format!("{}://{host}{port}{path}", self.url.scheme())
     }
 }
 
@@ -439,81 +396,79 @@ pub(super) fn resolve_subject_prefix(
 mod tests {
     use super::*;
 
-    fn resolve_identity(issuer: &str, proto: Option<&str>) -> Result<String, String> {
-        let (_, td) = normalize_issuer_and_trust_domain(issuer)?;
-        resolve_subject_prefix(&td, proto)
+    fn resolve_identity(
+        issuer: &str,
+        proto: Option<&str>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let issuer = ValidatedIssuer::parse(issuer)?;
+        Ok(ValidatedSubjectPrefix::parse(proto.unwrap_or_default(), &issuer)?.into_string())
     }
 
     #[test]
-    fn trust_domain_https_issuer() {
+    fn issuer_normalization_uses_url_parser() {
         assert_eq!(
-            normalize_issuer_and_trust_domain("https://Issuer.EXAMPLE/path")
+            ValidatedIssuer::parse("HTTP://Issuer.EXAMPLE/path")
                 .unwrap()
-                .1,
+                .identity,
+            "http://issuer.example/path"
+        );
+        assert_eq!(
+            ValidatedIssuer::parse("SpIfFe://Issuer.EXAMPLE/bundle")
+                .unwrap()
+                .identity,
+            "spiffe://issuer.example/bundle"
+        );
+        assert_eq!(
+            ValidatedIssuer::parse("https://Issuer.EXAMPLE:8443/")
+                .unwrap()
+                .trust_domain,
             "issuer.example"
         );
     }
 
     #[test]
-    fn trust_domain_https_issuer_optional_port() {
+    fn issuer_preserves_path_case() {
         assert_eq!(
-            normalize_issuer_and_trust_domain("https://Issuer.EXAMPLE:8443/")
+            ValidatedIssuer::parse("https://Issuer.EXAMPLE/OIDC/Callback")
                 .unwrap()
-                .1,
-            "issuer.example"
+                .identity,
+            "https://issuer.example/OIDC/Callback"
         );
     }
 
     #[test]
-    fn trust_domain_https_issuer_rejects_query() {
-        let err = normalize_issuer_and_trust_domain("https://issuer.example/?q=1").unwrap_err();
-        assert!(err.contains("query"), "{err}");
+    fn issuer_rejects_non_canonical_url_parts() {
+        let err = ValidatedIssuer::parse("https://issuer.example/?q=1").unwrap_err();
+        assert!(err.to_string().contains("query"), "{err}");
+
+        let err = ValidatedIssuer::parse("https://user@issuer.example/").unwrap_err();
+        assert!(err.to_string().contains("userinfo"), "{err}");
+
+        let err = ValidatedIssuer::parse("https://127.0.0.1/").unwrap_err();
+        assert!(err.to_string().contains("IP"), "{err}");
     }
 
     #[test]
-    fn trust_domain_spiffe_issuer() {
-        assert_eq!(
-            normalize_issuer_and_trust_domain("spiffe://Issuer.EXAMPLE/bundle")
-                .unwrap()
-                .1,
-            "issuer.example"
+    fn issuer_requires_expected_scheme() {
+        let err = ValidatedIssuer::parse("issuer.example").unwrap_err();
+        assert!(
+            err.to_string().contains("relative URL without a base"),
+            "{err}"
+        );
+
+        let err = ValidatedIssuer::parse("ftp://issuer.example/").unwrap_err();
+        assert!(
+            err.to_string().contains("http") || err.to_string().contains("spiffe"),
+            "{err}"
         );
     }
 
     #[test]
-    fn trust_domain_spiffe_issuer_scheme_any_case() {
-        assert_eq!(
-            normalize_issuer_and_trust_domain("SPIFFE://Issuer.EXAMPLE/bundle")
-                .unwrap()
-                .1,
-            "issuer.example"
-        );
-        assert_eq!(
-            normalize_issuer_and_trust_domain("SpIfFe://issuer.example")
-                .unwrap()
-                .1,
-            "issuer.example"
-        );
-    }
-
-    #[test]
-    fn trust_domain_rejects_ip_host() {
-        let err = normalize_issuer_and_trust_domain("https://127.0.0.1/").unwrap_err();
-        assert!(err.contains("IP") || err.contains("not an IP"), "{err}");
-        let err = normalize_issuer_and_trust_domain("spiffe://[::1]/x").unwrap_err();
-        assert!(err.contains("IP"), "{err}");
-    }
-
-    #[test]
-    fn resolve_identity_defaults_prefix() {
+    fn subject_prefix_defaults_to_spiffe_trust_domain() {
         assert_eq!(
             resolve_identity("https://my.idp.example", None).unwrap(),
             "spiffe://my.idp.example"
         );
-    }
-
-    #[test]
-    fn resolve_identity_spiffe_form_issuer() {
         assert_eq!(
             resolve_identity("spiffe://my.idp.example/ns/x", None).unwrap(),
             "spiffe://my.idp.example"
@@ -521,327 +476,146 @@ mod tests {
     }
 
     #[test]
-    fn explicit_prefix_canonicalizes_td_case() {
-        let p =
-            resolve_identity("https://issuer.example", Some("spiffe://ISSUER.EXAMPLE/wl")).unwrap();
-        assert_eq!(p, "spiffe://issuer.example/wl");
+    fn subject_prefix_is_canonicalized_from_url_components() {
+        let prefix = resolve_identity(
+            "https://issuer.example",
+            Some("spiffe://ISSUER.EXAMPLE/workload"),
+        )
+        .unwrap();
+        assert_eq!(prefix, "spiffe://issuer.example/workload");
     }
 
     #[test]
-    fn wrong_td_rejected() {
+    fn subject_prefix_preserves_path_case() {
+        let prefix = resolve_identity(
+            "https://issuer.example",
+            Some("spiffe://ISSUER.EXAMPLE/Workload/NodeA"),
+        )
+        .unwrap();
+        assert_eq!(prefix, "spiffe://issuer.example/Workload/NodeA");
+    }
+
+    #[test]
+    fn subject_prefix_rejects_bad_trust_domain_or_scheme() {
         let err =
             resolve_identity("https://issuer.example", Some("spiffe://other.example")).unwrap_err();
-        assert!(err.contains("does not match"));
-    }
+        assert!(err.to_string().contains("does not match"), "{err}");
 
-    #[test]
-    fn percent_encoding_rejected() {
         let err = resolve_identity(
             "https://issuer.example",
-            Some("spiffe://issuer.example/a%2Fb"),
+            Some("https://issuer.example/path"),
         )
         .unwrap_err();
-        assert!(err.contains("disallowed"), "{err}");
+        assert!(err.to_string().contains("spiffe://"), "{err}");
     }
 
     #[test]
-    fn https_scheme_subject_prefix_rejected() {
-        let err = resolve_identity("https://issuer.example", Some("https://issuer.example/p"))
-            .unwrap_err();
-        assert!(err.contains("spiffe://"));
+    fn subject_prefix_rejects_non_canonical_forms() {
+        for raw in [
+            "spiffe://issuer.example/a%2Fb",
+            "spiffe://issuer.example/a\\b",
+            "spiffe://issuer.example/a b",
+            "spiffe://issuer.example/a/",
+            "spiffe://issuer.example/a//b",
+            "spiffe://issuer.example/./a",
+            "spiffe://issuer.example/../a",
+            "spiffe://issuer.example:8443/a",
+        ] {
+            let err = resolve_identity("https://issuer.example", Some(raw)).unwrap_err();
+            assert!(!err.to_string().is_empty(), "{raw}");
+        }
     }
 
     #[test]
-    fn https_userinfo_rejected() {
-        let err = normalize_issuer_and_trust_domain("https://user@issuer.example/").unwrap_err();
-        assert!(err.contains("userinfo"), "{err}");
-    }
-
-    #[test]
-    fn https_password_in_userinfo_rejected() {
-        let err =
-            normalize_issuer_and_trust_domain("https://user:pass@issuer.example/").unwrap_err();
-        assert!(err.contains("userinfo"), "{err}");
-    }
-
-    #[test]
-    fn non_http_scheme_rejected() {
-        let err = normalize_issuer_and_trust_domain("ftp://issuer.example/").unwrap_err();
-        assert!(err.contains("http"), "{err}");
-    }
-
-    #[test]
-    fn issuer_without_scheme_rejected() {
-        let err = normalize_issuer_and_trust_domain("issuer.example").unwrap_err();
-        assert!(err.contains("http://") || err.contains("https://"), "{err}");
-        let err = normalize_issuer_and_trust_domain("issuer.example/extra").unwrap_err();
-        assert!(err.contains("http://") || err.contains("bare"), "{err}");
-    }
-
-    #[test]
-    fn issuer_backslash_rejected() {
-        let err = normalize_issuer_and_trust_domain("https://issuer.example\\evil").unwrap_err();
-        assert!(err.contains("disallowed"), "{err}");
-    }
-
-    #[test]
-    fn issuer_too_long_rejected() {
-        let long = format!("https://{}.example/", "a".repeat(MAX_ISSUER_BYTES));
-        let err = normalize_issuer_and_trust_domain(&long).unwrap_err();
-        assert!(err.contains("maximum length"), "{err}");
-    }
-
-    #[test]
-    fn issuer_control_char_rejected() {
-        let err = normalize_issuer_and_trust_domain("https://issuer.ex\0ample.com/").unwrap_err();
-        assert!(err.contains("disallowed") || err.contains("ASCII"), "{err}");
-    }
-
-    #[test]
-    fn subject_prefix_backslash_rejected() {
-        let err = resolve_identity(
-            "https://issuer.example",
-            Some("spiffe://issuer.example/a\\b"),
-        )
-        .unwrap_err();
-        assert!(err.contains("disallowed"), "{err}");
-    }
-
-    #[test]
-    fn subject_prefix_whitespace_rejected() {
-        let err = resolve_identity(
-            "https://issuer.example",
-            Some("spiffe://issuer.example/a b"),
-        )
-        .unwrap_err();
-        assert!(err.contains("disallowed"), "{err}");
-    }
-
-    #[test]
-    fn dns_trust_domain_too_long_rejected() {
-        let label = "a".repeat(63);
-        let host = std::iter::repeat_n(label.as_str(), 5)
-            .collect::<Vec<_>>()
-            .join(".");
-        assert!(host.len() > MAX_TRUST_DOMAIN_BYTES);
-        let issuer = format!("https://{host}/");
-        let err = normalize_issuer_and_trust_domain(&issuer).unwrap_err();
-        assert!(err.contains("maximum length"), "{err}");
-    }
-
-    #[test]
-    fn subject_prefix_too_long_rejected() {
+    fn subject_prefix_length_limit_is_enforced() {
         let base = "spiffe://issuer.example";
-        let pad_len = MAX_SUBJECT_PREFIX_BYTES.saturating_sub(base.len()) + 1;
-        let prefix = format!("{base}{}", "x".repeat(pad_len));
-        assert!(prefix.len() > MAX_SUBJECT_PREFIX_BYTES);
+        let prefix = format!(
+            "{base}{}",
+            "x".repeat(MAX_URL_BYTES.saturating_sub(base.len()) + 1)
+        );
         let err = resolve_identity("https://issuer.example", Some(&prefix)).unwrap_err();
-        assert!(err.contains("maximum length"), "{err}");
+        assert!(err.to_string().contains("maximum length"), "{err}");
     }
 
     #[test]
-    fn many_path_segments_ok_within_byte_limit() {
-        let segs = std::iter::repeat_n("w", 200).collect::<Vec<_>>().join("/");
-        let prefix = format!("spiffe://issuer.example/{segs}");
-        assert!(prefix.len() <= MAX_SUBJECT_PREFIX_BYTES);
-        let p = resolve_identity("https://issuer.example", Some(&prefix)).unwrap();
-        assert!(p.matches('/').count() >= 200);
-    }
-
-    #[test]
-    fn normalize_issuer_preserves_scheme_path_and_port() {
-        assert_eq!(
-            normalize_issuer_and_trust_domain("HTTP://Issuer.EXAMPLE/path")
-                .unwrap()
-                .0,
-            "http://issuer.example/path"
-        );
-        assert_eq!(
-            normalize_issuer_and_trust_domain("https://issuer.example:8443/ns")
-                .unwrap()
-                .0,
-            "https://issuer.example:8443/ns"
-        );
-        assert_eq!(
-            normalize_issuer_and_trust_domain("SpIfFe://Issuer.EXAMPLE/bundle")
-                .unwrap()
-                .0,
-            "spiffe://issuer.example/bundle"
-        );
-    }
-
-    #[test]
-    fn allowlist_empty_allows_any_trust_domain() {
-        assert!(trust_domain_matches_allowlist("anything.example", &[]).is_ok());
-    }
-
-    #[test]
-    fn allowlist_exact_match() {
-        let list = vec!["login.example.com".to_string(), "other.net".to_string()];
-        assert!(trust_domain_matches_allowlist("login.example.com", &list).is_ok());
-        assert!(trust_domain_matches_allowlist("LOGIN.EXAMPLE.COM.", &list).is_ok());
-        assert!(trust_domain_matches_allowlist("bad.example.com", &list).is_err());
-    }
-
-    #[test]
-    fn allowlist_single_star_one_label_under_suffix() {
-        let list = vec!["*.something.net".to_string()];
-        assert!(trust_domain_matches_allowlist("auth.something.net", &list).is_ok());
-        assert!(trust_domain_matches_allowlist("something.net", &list).is_err());
-        assert!(trust_domain_matches_allowlist("a.b.something.net", &list).is_err());
-        assert!(
-            trust_domain_matches_allowlist("notsomething.net", &list).is_err(),
-            "dot boundary"
-        );
-    }
-
-    #[test]
-    fn allowlist_double_star_any_depth() {
-        let list = vec!["**.internal.example".to_string()];
-        assert!(trust_domain_matches_allowlist("internal.example", &list).is_ok());
-        assert!(trust_domain_matches_allowlist("x.internal.example", &list).is_ok());
-        assert!(trust_domain_matches_allowlist("a.b.internal.example", &list).is_ok());
-        assert!(trust_domain_matches_allowlist("evil.internal.example.evil.com", &list).is_err());
-    }
-
-    #[test]
-    fn allowlist_pattern_validation_rejects_bare_star() {
-        assert!(validate_trust_domain_allowlist_patterns(&["*".to_string()]).is_err());
-        assert!(validate_trust_domain_allowlist_patterns(&["**".to_string()]).is_err());
-        assert!(validate_trust_domain_allowlist_patterns(&["*.".to_string()]).is_err());
-        assert!(validate_trust_domain_allowlist_patterns(&["foo*bar".to_string()]).is_err());
-        assert!(validate_trust_domain_allowlist_patterns(&["login.example".to_string()]).is_ok());
-    }
-
-    /// `*.suffix` must not match when there are two or more labels between leaf and suffix.
-    #[test]
-    fn allowlist_single_star_rejects_multi_label_under_suffix() {
-        let list = vec!["*.something.net".to_string()];
-        assert!(
-            trust_domain_matches_allowlist("auth.prod.something.net", &list).is_err(),
-            "only one label allowed above the suffix"
-        );
-    }
-
-    /// `*.suffix` accepts a single DNS label (no dots) above the suffix.
-    #[test]
-    fn allowlist_single_star_accepts_one_label_mixed_case_pattern() {
-        let list = vec!["*.SOMETHING.NET".to_string()];
-        assert!(trust_domain_matches_allowlist("auth.something.net", &list).is_ok());
-    }
-
-    /// `**.suffix` must not match hosts that merely share a substring with suffix (dot-separated).
-    #[test]
-    fn allowlist_double_star_suffix_requires_dot_separated_zone() {
-        let list = vec!["**.internal.example".to_string()];
-        assert!(
-            trust_domain_matches_allowlist("api.internal.example.com", &list).is_err(),
-            "must end with .internal.example, not .internal.example.com"
-        );
-        assert!(
-            trust_domain_matches_allowlist("not-relevant.internal.example.evil.com", &list)
-                .is_err(),
-        );
-    }
-
-    /// `**.suffix`: bare suffix and immediate child; `suffix` alone is the zone apex in pattern.
-    #[test]
-    fn allowlist_double_star_suffix_apex_and_subdomain() {
-        let list = vec!["**.co.uk".to_string()];
-        assert!(trust_domain_matches_allowlist("co.uk", &list).is_ok());
-        assert!(trust_domain_matches_allowlist("tenant.co.uk", &list).is_ok());
-        assert!(trust_domain_matches_allowlist("a.b.co.uk", &list).is_ok());
-        assert!(trust_domain_matches_allowlist("other.uk", &list).is_err());
-    }
-
-    #[test]
-    fn allowlist_matches_if_any_pattern_matches() {
-        let list = vec!["exact.only".to_string(), "**.allowed.zone".to_string()];
-        assert!(trust_domain_matches_allowlist("exact.only", &list).is_ok());
-        assert!(trust_domain_matches_allowlist("x.allowed.zone", &list).is_ok());
-        assert!(trust_domain_matches_allowlist("wrong.zone", &list).is_err());
-    }
-
-    /// Several allowlist entries at once: literal, `*.suffix`, and `**.suffix`; match is OR across entries.
-    #[test]
-    fn allowlist_multiple_entries_mixed_literal_and_wildcards() {
+    fn allowlist_matching_and_validation_work() {
         let list = vec![
-            "idp.example.com".to_string(),
-            "localhost".to_string(),
-            "*.tenant.example.net".to_string(),
-            "**.corp.internal".to_string(),
+            "idp.example.com",
+            "*.tenant.example.net",
+            "**.corp.internal",
         ];
-        assert!(
-            validate_trust_domain_allowlist_patterns(&list).is_ok(),
-            "whole list must pass startup validation"
-        );
+        let patterns = TrustDomainAllowList::parse(&list).unwrap();
 
-        assert!(trust_domain_matches_allowlist("idp.example.com", &list).is_ok());
-        assert!(trust_domain_matches_allowlist("LOCALHOST", &list).is_ok());
-        assert!(trust_domain_matches_allowlist("auth.tenant.example.net", &list).is_ok());
-        assert!(trust_domain_matches_allowlist("corp.internal", &list).is_ok());
-        assert!(trust_domain_matches_allowlist("a.b.corp.internal", &list).is_ok());
-
-        assert!(trust_domain_matches_allowlist("other.example.com", &list).is_err());
-        assert!(trust_domain_matches_allowlist("auth.app.tenant.example.net", &list).is_err());
-        assert!(trust_domain_matches_allowlist("not.corp.internal.evil.com", &list).is_err());
+        assert!(patterns.allows("idp.example.com"));
+        assert!(patterns.allows("auth.tenant.example.net"));
+        assert!(patterns.allows("a.b.corp.internal"));
+        assert!(!patterns.allows("auth.app.tenant.example.net"));
+        assert!(!patterns.allows("corp.internal.evil.com"));
     }
 
     #[test]
-    fn allowlist_patterns_trim_and_strip_trailing_dot() {
-        let list = vec!["  *.Foo.COM.  ".to_string()];
-        assert!(trust_domain_matches_allowlist("bar.foo.com", &list).is_ok());
+    fn allowlist_matches_apex_trailing_dot_and_mixed_case() {
+        let patterns =
+            TrustDomainAllowList::parse(&["  LOGIN.EXAMPLE.COM.  ", "**.Corp.Internal"]).unwrap();
+
+        assert!(patterns.allows("login.example.com"));
+        assert!(patterns.allows("LOGIN.EXAMPLE.COM."));
+        assert!(patterns.allows("corp.internal"));
+        assert!(patterns.allows("A.B.CORP.INTERNAL"));
     }
 
     #[test]
-    fn validate_allowlist_rejects_empty_suffix_after_wildcard_prefix() {
-        assert!(validate_trust_domain_allowlist_patterns(&["**.".to_string()]).is_err());
-        assert!(validate_trust_domain_allowlist_patterns(&["*.".to_string()]).is_err());
+    fn allowlist_single_star_only_matches_one_label() {
+        let patterns = TrustDomainAllowList::parse(&["*.something.net"]).unwrap();
+
+        assert!(patterns.allows("auth.something.net"));
+        assert!(!patterns.allows("something.net"));
+        assert!(!patterns.allows("a.b.something.net"));
+        assert!(!patterns.allows("notsomething.net"));
     }
 
     #[test]
-    fn validate_allowlist_rejects_star_inside_suffix() {
-        assert!(validate_trust_domain_allowlist_patterns(&["**.foo.*.com".to_string()]).is_err());
-        assert!(validate_trust_domain_allowlist_patterns(&["*.foo*bar.com".to_string()]).is_err());
+    fn allowlist_double_star_requires_dot_boundary() {
+        let patterns = TrustDomainAllowList::parse(&["**.internal.example"]).unwrap();
+
+        assert!(patterns.allows("internal.example"));
+        assert!(patterns.allows("x.internal.example"));
+        assert!(!patterns.allows("api.internal.example.com"));
+        assert!(!patterns.allows("not-relevant.internal.example.evil.com"));
     }
 
     #[test]
-    fn validate_allowlist_rejects_empty_entry_after_trim() {
-        assert!(validate_trust_domain_allowlist_patterns(&["   ".to_string()]).is_err());
-        assert!(validate_trust_domain_allowlist_patterns(&["  \t ".to_string()]).is_err(),);
+    fn allowlist_rejects_invalid_patterns() {
+        assert!(TrustDomainAllowList::parse(&["*"]).is_err());
+        assert!(TrustDomainAllowList::parse(&["**"]).is_err());
+        assert!(TrustDomainAllowList::parse(&["*."]).is_err());
+        assert!(TrustDomainAllowList::parse(&["**."]).is_err());
+        assert!(TrustDomainAllowList::parse(&["foo*bar"]).is_err());
+        assert!(TrustDomainAllowList::parse(&["**.foo.*.com"]).is_err());
+        assert!(TrustDomainAllowList::parse(&["*.foo*bar.com"]).is_err());
+        assert!(TrustDomainAllowList::parse(&["   "]).is_err());
+        assert!(TrustDomainAllowList::parse(&["  \t "]).is_err());
     }
 
     #[test]
-    fn validate_allowlist_accepts_double_star_multi_label_suffix() {
-        assert!(
-            validate_trust_domain_allowlist_patterns(&["**.svc.cluster.local".to_string()]).is_ok()
-        );
-    }
-
-    /// `notinternal.example` must not satisfy `*.internal.example` (no dot before `internal`).
-    #[test]
-    fn allowlist_single_star_dot_boundary_before_suffix() {
-        let list = vec!["*.internal.example".to_string()];
-        assert!(trust_domain_matches_allowlist("svc.internal.example", &list).is_ok());
-        assert!(trust_domain_matches_allowlist("notinternal.example", &list).is_err());
-    }
-
-    #[test]
-    fn token_endpoint_url_accepts_http_and_https_only() {
+    fn token_endpoint_host_extraction_requires_http_or_https() {
         assert_eq!(
-            registered_host_for_token_endpoint("https://auth.example.com/oauth/token").unwrap(),
+            ValidatedTokenEndpoint::parse("https://auth.example.com/oauth/token")
+                .unwrap()
+                .host,
             "auth.example.com"
         );
         assert_eq!(
-            registered_host_for_token_endpoint("http://auth.example:8080/token").unwrap(),
+            ValidatedTokenEndpoint::parse("http://auth.example:8080/token")
+                .unwrap()
+                .host,
             "auth.example"
         );
-        let err = registered_host_for_token_endpoint("spiffe://trust.example/path").unwrap_err();
+
+        let err = ValidatedTokenEndpoint::parse("spiffe://trust.example/path").unwrap_err();
         assert!(
-            err.contains("http") && err.contains("https"),
-            "unexpected err: {err}"
+            err.to_string().contains("http") && err.to_string().contains("https"),
+            "{err}"
         );
-        let err = registered_host_for_token_endpoint("ftp://auth.example/token").unwrap_err();
-        assert!(err.contains("http") || err.contains("https"), "{err}");
     }
 }

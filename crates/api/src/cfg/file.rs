@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -47,7 +48,7 @@ use model::network_security_group::NetworkSecurityGroupRule;
 use model::network_segment::NetworkDefinition;
 use model::resource_pool::define::ResourcePoolDef;
 use model::site_explorer::{EndpointExplorationReport, ExploredEndpoint};
-use model::tenant::TENANT_IDENTITY_SIGNING_JWT_ALG;
+use model::tenant::{TENANT_IDENTITY_SIGNING_JWT_ALG, TrustDomainAllowList};
 use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use utils::HostPortPair;
@@ -678,11 +679,11 @@ pub struct MachineIdentityConfig {
     /// Trust domains allowed for tenant JWT `iss` (normalized host). Empty = allow any.
     /// Patterns: exact hostname, `*.suffix` (one label under suffix), `**.suffix` (suffix or any subdomain).
     #[serde(default)]
-    pub trust_domain_allowlist: Vec<String>,
+    pub trust_domain_allowlist: TrustDomainAllowList,
     /// Allowed DNS names for the `token_endpoint` URL host (`http://` / `https://` only). Empty = allow any.
     /// Same pattern syntax as [`Self::trust_domain_allowlist`].
     #[serde(default)]
-    pub token_endpoint_domain_allowlist: Vec<String>,
+    pub token_endpoint_domain_allowlist: TrustDomainAllowList,
 }
 
 fn machine_identity_default_enabled() -> bool {
@@ -707,31 +708,31 @@ impl Default for MachineIdentityConfig {
             token_ttl_max_sec: machine_identity_default_token_ttl_max_sec(),
             token_endpoint_http_proxy: None,
             current_encryption_key_id: None,
-            trust_domain_allowlist: Vec::new(),
-            token_endpoint_domain_allowlist: Vec::new(),
+            trust_domain_allowlist: Default::default(),
+            token_endpoint_domain_allowlist: Default::default(),
         }
     }
 }
 
-impl From<MachineIdentityConfig> for model::tenant::IdentityConfigValidationBounds {
-    fn from(mi: MachineIdentityConfig) -> Self {
+impl<'a> From<&'a MachineIdentityConfig> for model::tenant::IdentityConfigValidationBounds<'a> {
+    fn from(mi: &'a MachineIdentityConfig) -> Self {
         Self {
             token_ttl_min_sec: mi.token_ttl_min_sec,
             token_ttl_max_sec: mi.token_ttl_max_sec,
-            algorithm: mi.algorithm,
-            encryption_key_id: mi.current_encryption_key_id.expect(
+            algorithm: Cow::Borrowed(&mi.algorithm),
+            encryption_key_id: Cow::Borrowed(mi.current_encryption_key_id.as_ref().expect(
                 "current_encryption_key_id is required when machine identity is enabled; \
                  statup validation in parse_carbide_config failed",
-            ),
-            trust_domain_allowlist: mi.trust_domain_allowlist,
+            )),
+            trust_domain_allowlist: Cow::Borrowed(&mi.trust_domain_allowlist),
         }
     }
 }
 
-impl From<MachineIdentityConfig> for model::tenant::TokenDelegationValidationBounds {
-    fn from(mi: MachineIdentityConfig) -> Self {
+impl<'a> From<&'a MachineIdentityConfig> for model::tenant::TokenDelegationValidationBounds<'a> {
+    fn from(mi: &'a MachineIdentityConfig) -> Self {
         Self {
-            token_endpoint_domain_allowlist: mi.token_endpoint_domain_allowlist,
+            token_endpoint_domain_allowlist: Cow::Borrowed(&mi.token_endpoint_domain_allowlist),
         }
     }
 }
@@ -3317,6 +3318,61 @@ mod tests {
                 scout_reporting_timeout: Duration::minutes(5),
                 uefi_boot_wait: Duration::minutes(5),
             }
+        );
+    }
+
+    #[test]
+    fn deserialize_machine_identity_allowlists_from_toml() {
+        let config = r#"
+enabled = true
+algorithm = "ES256"
+token_ttl_min_sec = 60
+token_ttl_max_sec = 86400
+current_encryption_key_id = "key-1"
+trust_domain_allowlist = ["login.example.com", "*.tenant.example.net", "**.corp.internal"]
+token_endpoint_domain_allowlist = ["auth.example.com", "**.oauth.internal"]
+"#;
+        let config: MachineIdentityConfig = toml::from_str(config).unwrap();
+
+        assert!(config.trust_domain_allowlist.allows("login.example.com"));
+        assert!(config.trust_domain_allowlist.allows("auth.tenant.example.net"));
+        assert!(config.trust_domain_allowlist.allows("corp.internal"));
+        assert!(!config.trust_domain_allowlist.allows("auth.app.tenant.example.net"));
+
+        assert!(config.token_endpoint_domain_allowlist.allows("auth.example.com"));
+        assert!(config.token_endpoint_domain_allowlist.allows("x.oauth.internal"));
+        assert!(!config.token_endpoint_domain_allowlist.allows("login.example.com"));
+    }
+
+    #[test]
+    fn deserialize_machine_identity_allowlists_defaults_when_omitted() {
+        let config = r#"
+enabled = false
+"#;
+        let config: MachineIdentityConfig = toml::from_str(config).unwrap();
+
+        assert!(config.trust_domain_allowlist.allows("anything.example"));
+        assert!(config.token_endpoint_domain_allowlist.allows("anything.example"));
+    }
+
+    #[test]
+    fn deserialize_machine_identity_rejects_invalid_trust_domain_allowlist() {
+        let config = r#"
+trust_domain_allowlist = ["**.foo.*.com"]
+"#;
+        let err = toml::from_str::<MachineIdentityConfig>(config).unwrap_err();
+        assert!(err.to_string().contains("invalid pattern"), "{err}");
+    }
+
+    #[test]
+    fn deserialize_machine_identity_rejects_invalid_token_endpoint_allowlist() {
+        let config = r#"
+token_endpoint_domain_allowlist = ["foo*bar"]
+"#;
+        let err = toml::from_str::<MachineIdentityConfig>(config).unwrap_err();
+        assert!(
+            err.to_string().contains("wildcards only as `*.` or `**.` prefix"),
+            "{err}"
         );
     }
 
