@@ -12,6 +12,7 @@ applicable.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `listen` | `SocketAddr` | `[::]:1079` | Socket address for the gRPC API server. |
+| `bmc_proxy` | `Option<BmcProxyConfig>` | — | Standalone BMC proxy listener and allow-list config (see [BmcProxyConfig](#bmcproxyconfig)). |
 | `listen_only` | `bool` | `false` | Run passively (no background services, RPC/web only). Used in dev mode. |
 | `metrics_endpoint` | `Option<SocketAddr>` | — | Socket address for the Prometheus `/metrics` HTTP server. |
 | `alt_metric_prefix` | `Option<String>` | — | Alternative metric prefix emitted alongside `carbide_` for dashboard migration. |
@@ -105,6 +106,13 @@ applicable.
 | `identity_pemfile_path` | `String` | `""` | Server identity certificate PEM. |
 | `identity_keyfile_path` | `String` | `""` | Server identity private key. |
 | `admin_root_cafile_path` | `String` | `""` | Admin root CA for admin client validation. |
+
+### `BmcProxyConfig`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `listen` | `SocketAddr` | — | Socket address for the standalone BMC proxy server. |
+| `allowed_principals` | `Vec<String>` | `[]` | Exact principal identifiers allowed to use the proxy, using the same format as `Principal::as_identifier()`. |
 
 ### `AuthConfig`
 

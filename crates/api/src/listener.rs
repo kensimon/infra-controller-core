@@ -166,6 +166,185 @@ pub struct ConnectionAttributes {
     peer_certificates: Vec<CertificateDer<'static>>,
 }
 
+pub fn cert_description_layer(
+    auth_config: &Option<AuthConfig>,
+) -> eyre::Result<auth::middleware::CertDescriptionMiddleware> {
+    let extra_cli_certs = if let Some(auth_config) = auth_config {
+        auth_config.cli_certs.clone()
+    } else {
+        None
+    };
+
+    let spiffe_context = auth_config
+        .as_ref()
+        .and_then(|c| c.trust.as_ref())
+        .cloned()
+        .inspect(|trust_config| {
+            tracing::info!("TrustConfig rendered from config: {trust_config:?}")
+        })
+        .map(ForgeSpiffeContext::try_from)
+        .transpose()?
+        .ok_or(CarbideError::InvalidConfiguration(
+            ConfigValidationError::InvalidValue(
+                "could not parse trust config from auth config in carbide api config toml file"
+                    .to_string(),
+            ),
+        ))?;
+
+    Ok(auth::middleware::CertDescriptionMiddleware::new(
+        extra_cli_certs,
+        spiffe_context,
+    ))
+}
+
+pub async fn serve_router(
+    join_set: &mut JoinSet<()>,
+    app: axum::Router,
+    listen_mode: ApiListenMode,
+    listen_port: SocketAddr,
+    meter: Meter,
+    cancel_token: CancellationToken,
+) -> eyre::Result<()> {
+    let (tls_config, mut tls_acceptor, serve_plaintext_via_http1) = match listen_mode {
+        ApiListenMode::Tls(tls_config) => {
+            let tls_config_clone = tls_config.clone();
+            let tls_acceptor = tokio::task::Builder::new()
+                .name("get_tls_acceptor init")
+                .spawn_blocking(move || get_tls_acceptor(&tls_config_clone))?
+                .await?;
+            (Some(tls_config), tls_acceptor, false)
+        }
+        ApiListenMode::PlaintextHttp1 => (None, None, true),
+        ApiListenMode::PlaintextHttp2 => (None, None, false),
+    };
+
+    let listener = TcpListener::bind(listen_port).await?;
+    let http = http2::Builder::new(TokioExecutor::new());
+
+    let connection_total_counter = meter
+        .u64_counter("carbide-api.tls.connection_attempted")
+        .with_description("The amount of tls connections that were attempted")
+        .build();
+    let connection_succeeded_counter = meter
+        .u64_counter("carbide-api.tls.connection_success")
+        .with_description("The amount of tls connections that were successful")
+        .build();
+    let connection_failed_counter = meter
+        .u64_counter("carbide-api.tls.connection_fail")
+        .with_description("The amount of tcp connections that were failures")
+        .build();
+
+    let mut tls_acceptor_created = Instant::now();
+    let mut initialize_tls_acceptor = true;
+
+    join_set.build_task().name("listener accept loop").spawn(async move {
+        while let Some(incoming_connection) = cancel_token.run_until_cancelled(listener.accept()).await {
+            connection_total_counter.add(1, &[]);
+            let (conn, addr) = match incoming_connection {
+                Ok(incoming) => incoming,
+                Err(e) => {
+                    tracing::error!(error = %e, "Error accepting connection");
+                    connection_failed_counter
+                        .add(1, &[KeyValue::new("reason", "tcp_connection_failure")]);
+                    continue;
+                }
+            };
+
+            if let (Some(tls_config), true) = (
+                tls_config.as_ref(),
+                initialize_tls_acceptor
+                    || tls_acceptor_created.elapsed() > tokio::time::Duration::from_secs(5 * 60),
+            ) {
+                tracing::info!("Refreshing certs");
+                initialize_tls_acceptor = false;
+                tls_acceptor_created = Instant::now();
+
+                tls_acceptor = tokio::task::Builder::new()
+                    .name("get_tls_acceptor refresh")
+                    .spawn_blocking({
+                        let tls_config = tls_config.clone();
+                        move || get_tls_acceptor(&tls_config)
+                    })
+                    .expect("Failed to spawn blocking task")
+                    .await
+                    .expect("task panicked");
+            }
+
+            let tls_acceptor = tls_acceptor.clone();
+            let http = http.clone();
+            let app = app.clone();
+            let connection_succeeded_counter = connection_succeeded_counter.clone();
+            let connection_failed_counter = connection_failed_counter.clone();
+
+            tokio::task::Builder::new().name("http conn handler").spawn(async move {
+                if let Some(tls_acceptor) = tls_acceptor {
+                    match tls_acceptor.accept(conn).await {
+                        Ok(conn) => {
+                            let conn = TokioIo::new(conn);
+                            connection_succeeded_counter.add(1, &[]);
+
+                            let (_, session) = conn.inner().get_ref();
+                            let connection_attributes = {
+                                let peer_address = addr;
+                                let peer_certificates =
+                                    session.peer_certificates().unwrap_or_default().to_vec();
+                                Arc::new(ConnectionAttributes {
+                                    peer_address,
+                                    peer_certificates,
+                                })
+                            };
+                            let conn_attrs_extension_layer =
+                                AddExtensionLayer::new(connection_attributes);
+
+                            let app_with_ext = tower::ServiceBuilder::new()
+                                .layer(conn_attrs_extension_layer)
+                                .service(app);
+
+                            if let Err(error) = http.serve_connection(conn, TowerToHyperService::new(app_with_ext)).await {
+                                tracing::debug!(%error, "error servicing tls http request: {error:?}");
+                            }
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, address = %addr, "error accepting tls connection");
+                            connection_failed_counter
+                                .add(1, &[KeyValue::new("reason", "tls_connection_failure")]);
+                        }
+                    }
+                } else {
+                    connection_succeeded_counter.add(1, &[]);
+
+                    let conn_attrs_extension_layer =
+                        AddExtensionLayer::new(Arc::new(ConnectionAttributes {
+                            peer_address: addr,
+                            peer_certificates: vec![],
+                        }));
+
+                    let conn = TokioIo::new(conn);
+
+                    let app_with_ext = tower::ServiceBuilder::new()
+                        .layer(conn_attrs_extension_layer)
+                        .service(app);
+
+                    let result = if serve_plaintext_via_http1 {
+                        http1::Builder::new().serve_connection(conn, TowerToHyperService::new(app_with_ext)).with_upgrades().await
+                    } else {
+                        http.serve_connection(conn, TowerToHyperService::new(app_with_ext)).await
+                    };
+
+                    if let Err(error) = result {
+                        tracing::debug!(%error, "error servicing plain http connection: {error:?}");
+                    }
+                }
+            })
+                .expect("could not spawn task to handle HTTP connection");
+        }
+
+        tracing::info!("carbide-api shutting down");
+    })?;
+
+    Ok(())
+}
+
 impl ConnectionAttributes {
     pub fn peer_address(&self) -> &SocketAddr {
         &self.peer_address
@@ -195,47 +374,7 @@ pub async fn start(
         .register_encoded_file_descriptor_set(::rpc::REFLECTION_API_SERVICE_DESCRIPTOR)
         .build_v1alpha()?;
 
-    let (tls_config, mut tls_acceptor, serve_plaintext_via_http1) = match listen_mode {
-        ApiListenMode::Tls(tls_config) => {
-            let tls_config_clone = tls_config.clone();
-            let tls_acceptor = tokio::task::Builder::new()
-                .name("get_tls_acceptor init")
-                .spawn_blocking(move || get_tls_acceptor(&tls_config_clone))?
-                .await?;
-            (Some(tls_config), tls_acceptor, false)
-        }
-        ApiListenMode::PlaintextHttp1 => (None, None, true),
-        ApiListenMode::PlaintextHttp2 => (None, None, false),
-    };
-
-    let listener = TcpListener::bind(listen_port).await?;
-    let http = http2::Builder::new(TokioExecutor::new());
-
-    let extra_cli_certs = if let Some(auth_config) = auth_config {
-        auth_config.cli_certs.clone()
-    } else {
-        None
-    };
-
-    // Get cert trust config from the config file
-    let spiffe_context = auth_config
-        .as_ref()
-        .and_then(|c| c.trust.as_ref())
-        .cloned()
-        .inspect(|trust_config| {
-            tracing::info!("TrustConfig rendered from config: {trust_config:?}")
-        })
-        .map(ForgeSpiffeContext::try_from)
-        .transpose()?
-        .ok_or(CarbideError::InvalidConfiguration(
-            ConfigValidationError::InvalidValue(
-                "could not parse trust config from auth config in carbide api config toml file"
-                    .to_string(),
-            ),
-        ))?;
-
-    let cert_description_layer =
-        auth::middleware::CertDescriptionMiddleware::new(extra_cli_certs, spiffe_context);
+    let cert_description_layer = cert_description_layer(auth_config)?;
     let casbin_layer = if let Some(auth_config) = auth_config {
         if let Some(casbin_policy_file) = &auth_config.casbin_policy_file {
             let casbin_authorizer = Arc::new(
@@ -279,6 +418,22 @@ pub async fn start(
         .option_layer(internal_rbac_layer)
         .option_layer(casbin_layer)
         .service(router);
+
+    let (tls_config, mut tls_acceptor, serve_plaintext_via_http1) = match listen_mode {
+        ApiListenMode::Tls(tls_config) => {
+            let tls_config_clone = tls_config.clone();
+            let tls_acceptor = tokio::task::Builder::new()
+                .name("get_tls_acceptor init")
+                .spawn_blocking(move || get_tls_acceptor(&tls_config_clone))?
+                .await?;
+            (Some(tls_config), tls_acceptor, false)
+        }
+        ApiListenMode::PlaintextHttp1 => (None, None, true),
+        ApiListenMode::PlaintextHttp2 => (None, None, false),
+    };
+
+    let listener = TcpListener::bind(listen_port).await?;
+    let http = http2::Builder::new(TokioExecutor::new());
 
     let connection_total_counter = meter
         .u64_counter("carbide-api.tls.connection_attempted")

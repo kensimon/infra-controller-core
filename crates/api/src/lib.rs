@@ -67,6 +67,7 @@ macro_rules! test_assert {
 mod api;
 mod attestation;
 mod auth;
+mod bmc_proxy;
 mod cfg;
 mod credentials;
 mod db_init;
@@ -123,4 +124,8 @@ pub use redfish::RedfishClientPoolImpl;
 pub use site_explorer::BmcEndpointExplorer;
 
 // Stuff needed by main.rs and api-test
-pub use crate::{cfg::command_line::Command, cfg::command_line::Options, run::run};
+pub use crate::{
+    cfg::command_line::Command,
+    cfg::command_line::Options,
+    run::{run, run_bmc_proxy},
+};

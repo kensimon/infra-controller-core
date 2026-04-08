@@ -74,6 +74,9 @@ pub struct CarbideConfig {
     #[serde(default = "default_listen")]
     pub listen: SocketAddr,
 
+    /// Configuration for the standalone BMC proxy server.
+    pub bmc_proxy: Option<BmcProxyConfig>,
+
     /// Run this instance passively: no background services,
     /// just listen for RPC/web connections. Used in dev mode
     /// when running a second nico instance against a
@@ -1908,6 +1911,20 @@ pub struct TlsConfig {
     /// admin client validation.
     #[serde(default)]
     pub admin_root_cafile_path: String,
+}
+
+/// Standalone BMC proxy listener and authorization configuration.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct BmcProxyConfig {
+    /// Socket address for the standalone BMC proxy HTTP server.
+    pub listen: SocketAddr,
+
+    /// Principals allowed to use the proxy.
+    ///
+    /// Values use the same identifier format as [`crate::auth::Principal::as_identifier`],
+    /// for example `spiffe-service-id/foo`, `trusted-certificate`, or `anonymous`.
+    #[serde(default)]
+    pub allowed_principals: Vec<String>,
 }
 
 /// The transport protocol mode for the gRPC API server.

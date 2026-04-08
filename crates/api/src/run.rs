@@ -31,7 +31,7 @@ use crate::logging::setup::{
 };
 use crate::nv_redfish::NvRedfishClientPool;
 use crate::redfish::RedfishClientPoolImpl;
-use crate::{CarbideError, dynamic_settings, setup};
+use crate::{CarbideError, bmc_proxy, dynamic_settings, setup};
 
 pub async fn run(
     debug: u8,
@@ -219,5 +219,129 @@ pub async fn run(
     // propagated here.
     join_set.join_all().await;
 
+    Ok(())
+}
+
+pub async fn run_bmc_proxy(
+    debug: u8,
+    config_str: String,
+    site_config_str: Option<String>,
+    credential_config: CredentialConfig,
+    skip_logging_setup: bool,
+    cancel_token: CancellationToken,
+    ready_channel: Sender<()>,
+) -> eyre::Result<()> {
+    let carbide_config = setup::parse_carbide_config(config_str, site_config_str)?;
+    let proxy_config = carbide_config.bmc_proxy.clone().ok_or_else(|| {
+        eyre::eyre!("missing [bmc_proxy] configuration for carbide-api bmc-proxy")
+    })?;
+
+    let tconf = if skip_logging_setup {
+        Logging::default()
+    } else {
+        setup_logging(
+            debug,
+            crate::state_controller::machine::extra_logfmt_logging_fields(),
+            None::<NoSubscriber>,
+        )
+        .wrap_err("setup_telemetry")?
+    };
+
+    let print_config = carbide_config.redacted();
+    tracing::info!("Using configuration: {:#?}", print_config);
+
+    let metrics = create_metrics()?;
+    create_metric_for_spancount_reader(&metrics.meter, tconf.spancount_reader);
+
+    let mut join_set = JoinSet::new();
+
+    if let Some(metrics_address) = carbide_config.metrics_endpoint {
+        let additional_prefix = carbide_config
+            .alt_metric_prefix
+            .clone()
+            .map(|alt_prefix| ("carbide_".to_string(), alt_prefix));
+        join_set.build_task().name("metrics_endpoint").spawn({
+            let cancel_token = cancel_token.clone();
+            async move {
+                if let Err(e) = run_metrics_endpoint(
+                    &MetricsEndpointConfig {
+                        address: metrics_address,
+                        registry: metrics.registry,
+                        additional_prefix,
+                    },
+                    cancel_token,
+                )
+                .await
+                {
+                    tracing::error!("Metrics endpoint failed with error: {}", e);
+                }
+            }
+        })?;
+    }
+
+    let dynamic_settings = crate::dynamic_settings::DynamicSettings {
+        log_filter: tconf.filter.clone(),
+        create_machines: carbide_config.site_explorer.create_machines.clone(),
+        bmc_proxy: carbide_config.site_explorer.bmc_proxy.clone(),
+        tracing_enabled: tconf.tracing_enabled,
+    };
+    dynamic_settings.start_reset_task(
+        &mut join_set,
+        dynamic_settings::RESET_PERIOD,
+        cancel_token.clone(),
+    );
+
+    tracing::info!(
+        address = proxy_config.listen.to_string(),
+        build_version = carbide_version::v!(build_version),
+        build_date = carbide_version::v!(build_date),
+        rust_version = carbide_version::v!(rust_version),
+        "Start carbide-api BMC proxy",
+    );
+
+    let _certificate_provider =
+        create_vault_client(&credential_config.vault, metrics.meter.clone())?;
+    let credential_manager =
+        create_credential_manager(&credential_config, metrics.meter.clone()).await?;
+    let db_pool = setup::create_and_connect_postgres_pool(&carbide_config).await?;
+
+    let listen_mode = match &carbide_config.listen_mode {
+        crate::cfg::file::ListenMode::Tls => {
+            let tls_ref = carbide_config.tls.as_ref().expect("Missing tls config");
+
+            crate::listener::ApiListenMode::Tls(Arc::new(crate::listener::ApiTlsConfig {
+                identity_pemfile_path: tls_ref.identity_pemfile_path.clone(),
+                identity_keyfile_path: tls_ref.identity_keyfile_path.clone(),
+                root_cafile_path: tls_ref.root_cafile_path.clone(),
+                admin_root_cafile_path: tls_ref.admin_root_cafile_path.clone(),
+            }))
+        }
+        crate::cfg::file::ListenMode::PlaintextHttp1 => crate::listener::ApiListenMode::PlaintextHttp1,
+        crate::cfg::file::ListenMode::PlaintextHttp2 => crate::listener::ApiListenMode::PlaintextHttp2,
+    };
+
+    bmc_proxy::start(
+        &mut join_set,
+        db_pool,
+        credential_manager,
+        dynamic_settings,
+        listen_mode,
+        &carbide_config.auth,
+        &proxy_config,
+        metrics.meter,
+        cancel_token,
+    )
+    .await?;
+
+    ready_channel
+        .send(())
+        .inspect_err(|_e| {
+            tracing::warn!(
+                "Bug: bmc proxy ready_channel is closed, could not notify readiness status"
+            )
+        })
+        .ok();
+
+    join_set.join_all().await;
     Ok(())
 }

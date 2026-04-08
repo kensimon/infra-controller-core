@@ -211,7 +211,7 @@ pub fn create_ipmi_tool(
 /// Configure and create a postgres connection pool
 ///
 /// This connects to the database to verify settings
-async fn create_and_connect_postgres_pool(config: &CarbideConfig) -> eyre::Result<PgPool> {
+pub(crate) async fn create_and_connect_postgres_pool(config: &CarbideConfig) -> eyre::Result<PgPool> {
     // We need logs to be enabled at least at `INFO` level. Otherwise
     // our global logging filter would reject the logs before they get injected
     // into the `SqlxQueryTracing` layer.

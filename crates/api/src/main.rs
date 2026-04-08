@@ -78,6 +78,26 @@ async fn main() -> eyre::Result<()> {
             )
             .await?;
         }
+        Command::BmcProxy(config) => {
+            let config_str = tokio::fs::read_to_string(&config.config_path).await?;
+            let site_config_str = if let Some(site_path) = &config.site_config_path {
+                Some(tokio::fs::read_to_string(&site_path).await?)
+            } else {
+                None
+            };
+
+            let (ready_tx, _ready_rx) = tokio::sync::oneshot::channel();
+            carbide::run_bmc_proxy(
+                debug,
+                config_str,
+                site_config_str,
+                CredentialConfig::default(),
+                false,
+                CancellationToken::new(),
+                ready_tx,
+            )
+            .await?;
+        }
     }
     Ok(())
 }

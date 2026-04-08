@@ -36,6 +36,9 @@ pub enum Command {
 
     #[clap(about = "Run the API service")]
     Run(Box<Daemon>),
+
+    #[clap(about = "Run only the BMC proxy service")]
+    BmcProxy(Box<Daemon>),
 }
 
 #[derive(Parser)]
