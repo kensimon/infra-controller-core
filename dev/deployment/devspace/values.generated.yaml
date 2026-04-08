@@ -18,3 +18,9 @@ carbide-api:
   extraEnv:
     - name: DISABLE_TLS_ENFORCEMENT
       value: "1"
+
+carbide-bmc-proxy:
+  extraEnv:
+    - name: DISABLE_TLS_ENFORCEMENT
+      value: "1"
+  automountServiceAccountToken: false

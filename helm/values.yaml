@@ -19,9 +19,9 @@
 ## ---------------------------------------------------------------------------
 global:
   ## Container image for Carbide core services (REQUIRED -- must be set by user)
-  ## Services that share this image: carbide-api, carbide-dhcp, carbide-dns,
-  ## carbide-dsx-exchange-consumer, carbide-hardware-health, carbide-pxe,
-  ## carbide-ssh-console-rs.
+  ## Services that share this image: carbide-api, carbide-bmc-proxy,
+  ## carbide-dhcp, carbide-dns, carbide-dsx-exchange-consumer,
+  ## carbide-hardware-health, carbide-pxe, carbide-ssh-console-rs.
   ## NOTE: unbound uses its own image settings.
   image:
     repository: ""
@@ -59,6 +59,14 @@ global:
 ## ---------------------------------------------------------------------------
 carbide-api:
   enabled: true
+
+## ---------------------------------------------------------------------------
+## carbide-bmc-proxy — Standalone BMC proxy
+## Reuses the carbide-api binary and credentials/config pipeline, but runs only
+## the BMC proxy entrypoint.
+## ---------------------------------------------------------------------------
+carbide-bmc-proxy:
+  enabled: false
 
 ## ---------------------------------------------------------------------------
 ## carbide-dhcp — DHCP server (Kea-based)
