@@ -1,167 +1,14 @@
 # carbide-bmc-proxy
 
-`carbide-bmc-proxy` is a small authenticated HTTP/2 proxy for BMC access.
+A small authenticated HTTP/2 proxy for BMC access:
 
-Its job is narrow:
+- authenticates callers with mTLS
+- authorizes callers by service principal
+- maps `Forwarded: host=<bmc_ip>` to a known BMC
+- fetches the BMC's admin credentials from vault
+- proxies the HTTP request to the target BMC
 
-- authenticate callers with mTLS
-- authorize callers by service principal
-- map `Forwarded: host=<bmc_ip>` to a known BMC
-- fetch the BMC's admin credentials from the existing secrets layer
-- proxy the HTTP request to the target BMC without exposing those credentials to the caller
-
-The point is not to make Carbide a universal facade for every BMC operation. The point is to keep BMC authentication and credential handling in one place, while allowing multiple higher-level systems to coexist as peers.
-
-## Why This Exists
-
-This crate exists because we have at least two valid constraints at the same time:
-
-- Carbide cannot assume it will be the only system that ever talks to BMCs.
-- We do not want every system that needs some BMC access to also get direct access to BMC admin credentials.
-
-Those constraints make "just add another Carbide RPC" a poor long-term boundary. If another service only needs access to a constrained set of BMC operations, pushing raw BMC credentials into that service is worse. A dedicated proxy gives us a middle ground:
-
-- one place to authenticate callers
-- one place to hold and rotate BMC credentials
-- one place to apply shared guardrails later
-- no requirement that every BMC consumer be implemented inside `carbide-api`
-
-This is especially relevant for integrations like DPF. The design goal is not "DPF talks through Carbide because Carbide owns everything." The design goal is "Carbide and DPF can both rely on the same credentialed BMC access layer."
-
-## What This Service Is
-
-This service is:
-
-- a common infrastructure component for authenticated BMC access
-- a thin HTTP proxy, not a high-level lifecycle management API
-- intentionally small and close to the existing Carbide authn/secrets stack
-
-This service is not:
-
-- a claim that arbitrary BMC pass-through is the final architecture forever
-- a mechanism for resolving all coordination conflicts between independent management systems
-- a replacement for higher-level APIs where those are the right abstraction
-
-If two peer systems can issue conflicting BMC operations, that conflict already exists. This proxy solves the authentication and credential distribution problem cleanly. It does not pretend to solve every multi-controller coordination problem by itself.
-
-## Architecture
-
-Today, the proxy reuses existing Carbide-adjacent building blocks:
-
-- `carbide-authn` for mTLS and SPIFFE principal extraction
-- `carbide-secrets` for BMC credential lookup
-- the Carbide database to resolve BMC IP to machine/BMC identity
-
-That is a practical implementation choice, not the architectural claim that "Carbide must sit in the middle of all BMC traffic."
-
-### Dependency View
-
-```mermaid
-flowchart LR
-    DPF[DPF or other peer service]
-    Carbide[carbide-api]
-    Proxy[carbide-bmc-proxy]
-    DB[(Carbide DB)]
-    Vault[(Secrets / Vault)]
-    BMC[BMC Redfish endpoint]
-
-    DPF --> Proxy
-    Carbide --> Proxy
-    Proxy --> DB
-    Proxy --> Vault
-    Proxy --> BMC
-```
-
-The important point in this picture is that both `carbide-api` and external peers can consume the same proxy. Neither needs direct access to BMC passwords.
-
-### Trust Boundary View
-
-```mermaid
-flowchart TB
-    subgraph Caller["Caller trust domain"]
-        Client[Client with mTLS cert]
-    end
-
-    subgraph ProxyBoundary["carbide-bmc-proxy"]
-        MTLS[mTLS termination + SPIFFE/external cert authn]
-        ALLOW[principal allow-list]
-        LOOKUP[DB lookup: BMC IP -> BMC identity]
-        CREDS[credential lookup]
-        FORWARD[upstream HTTP proxy]
-    end
-
-    subgraph BMCBoundary["BMC"]
-        Redfish[Redfish / HTTPS]
-    end
-
-    Client --> MTLS --> ALLOW --> LOOKUP --> CREDS --> FORWARD --> Redfish
-```
-
-The caller proves who it is with a client certificate. The proxy proves who the target BMC is, retrieves the corresponding credentials, and performs the backend request itself.
-
-## Request Flow
-
-At a high level, a request looks like this:
-
-1. A client connects over HTTPS with HTTP/2 and presents an mTLS certificate.
-2. `carbide-authn` validates the certificate chain and extracts principals such as a SPIFFE service identity.
-3. The proxy checks that at least one presented principal is listed in `allowed_principals`.
-4. The caller indicates the target BMC using `Forwarded: host=<bmc_ip>`.
-5. The proxy resolves that IP in the database to the corresponding BMC identity.
-6. The proxy fetches the BMC root credentials from the secrets manager.
-7. The proxy forwards the original HTTP request to the BMC using HTTPS and backend Basic Auth.
-8. The proxy returns the upstream response to the caller.
-
-### Request Sequence
-
-```mermaid
-sequenceDiagram
-    participant Client
-    participant Proxy as carbide-bmc-proxy
-    participant DB as Carbide DB
-    participant Vault as Secrets/Vault
-    participant BMC
-
-    Client->>Proxy: HTTPS + HTTP/2 + client cert
-    Client->>Proxy: GET /redfish/v1/...<br/>Forwarded: host=10.0.0.42
-    Proxy->>Proxy: authenticate + authorize principal
-    Proxy->>DB: resolve 10.0.0.42
-    DB-->>Proxy: BMC MAC / identity
-    Proxy->>Vault: get BMC credentials
-    Vault-->>Proxy: username/password
-    Proxy->>BMC: HTTPS request + Basic Auth
-    BMC-->>Proxy: Redfish response
-    Proxy-->>Client: proxied response
-```
-
-## Current Behavior
-
-The current implementation is intentionally simple:
-
-- listens for HTTPS with HTTP/2
-- authenticates clients with mTLS
-- supports SPIFFE-based service identity extraction, plus configured external/admin certs
-- authorizes requests with a principal allow-list
-- requires the target BMC to be supplied via the `Forwarded` header
-- looks up per-BMC credentials rather than sharing credentials with callers
-- strips hop-by-hop headers before proxying
-- limits request bodies to 8 MiB
-- exposes a separate metrics endpoint
-
-Notably, this crate currently does not implement a Redfish path allow-list of its own. If we want endpoint-level restrictions for specific consumers, that should be added explicitly and documented as policy, not implied.
-
-## Why A Proxy Instead Of More Carbide APIs
-
-There are cases where a high-level Carbide API is clearly the right answer. This crate is for the opposite case: when another system already operates in terms of a device-native API such as Redfish, but we still need centralized authentication and credential handling.
-
-Using a proxy for that case has a few advantages:
-
-- it avoids proliferating service-specific BMC password access
-- it avoids baking another product's raw BMC use cases into `carbide-api`
-- it lets Carbide and peer systems consume the same access layer
-- it gives us a clean place to add shared controls later, such as rate limits, auditing, or stronger authorization policy
-
-This is also why this crate was split out of `crates/api`: making the proxy a separate binary and separate crate makes the boundary explicit.
+The point is to keep BMC authentication and credential handling in one place, while allowing multiple higher-level systems to coexist as peers.
 
 ## Configuration
 
@@ -215,22 +62,116 @@ curl --http2 \
 
 The client chooses the BMC by IP. The proxy performs authentication, credential lookup, and backend authentication.
 
-## Operational Notes
 
-- The proxy trusts client certs from the configured SPIFFE root and optional admin root.
-- Backend BMC TLS verification is currently disabled in the reqwest client. That matches current pragmatic behavior for BMC environments, but it is a security tradeoff worth tightening over time.
-- TLS material for the listener is refreshed periodically without redesigning the service.
-- The proxy only knows how to reach BMCs that exist in the database and have credentials in the secrets manager.
+## Why?
+
+We have at least two valid constraints at the same time:
+
+1. Carbide cannot assume it will be the only system that ever talks to BMC's.
+2. We don't want to distribute BMC credentials to every system that needs BMC access
+
+So an authenticating proxy makes it so any system needing to talk to BMC's can do so without needing to spread credentials around.
+
+An alternative approach is to have carbide-api be the only service that talks to BMC's, and have all operations on BMC's be implemented as high-level gRPC methods on carbide-api. But this isn't really a scalable approach: there is other management software (such as [NVIDIA Domain Power Service (DPS)][DPS]) that cannot take a dependency on carbide, and these systems need to coexist. So in order to support this without sharing BMC credentials, the idea is that each system should be configurable to use a general-purpose proxy for talking to BMC's, and carbide-bmc-proxy is merely an implementation of this.
+
+## What's Using It?
+
+Currently (as of 2026-04-10), nothing yet.
+
+We soon expect that [DPS] will support configuration of an authenticating proxy like this one, to manage power configuration on BMC's. DPS is a standalone service that should not have a direct dependency on carbide-api. So carbide-bmc-proxy serves an implementation of such a proxy, although any proxy that implements similar functionality can work.
+
+carbide-api itself is *not* using this, yet. But it does support configuring a bmc-proxy URL via the `bmc_proxy` config setting, which will work if pointed at a running instance of this crate.
+
+Future work can implement a mode in carbide-api where it doesn't know about any BMC credentials, and would make all calls through carbide-bmc-proxy instead.
+
+## Architecture
+
+Today, the proxy reuses existing Carbide-adjacent building blocks:
+
+- `carbide-authn`:  mTLS and SPIFFE principal extraction
+- `carbide-secrets`: BMC credential lookup
+- `carbide-api-db`: Access to the carbide database to resolve BMC IP's to MAC addresses (necessary for looking up credentials.)
+
+### Dependency View
+
+```mermaid
+flowchart LR
+    DPF[DPF or other peer service]
+    Carbide[carbide-api]
+    Proxy[carbide-bmc-proxy]
+    DB[(Carbide DB)]
+    Vault[(Secrets / Vault)]
+    BMC[BMC Redfish endpoint]
+
+    DPF --> Proxy
+    Carbide --> Proxy
+    Proxy --> DB
+    Proxy --> Vault
+    Proxy --> BMC
+```
+
+The important point in this picture is that both `carbide-api` and external peers can consume the same proxy. Neither needs direct access to BMC passwords.
+
+### Trust Boundary View
+
+```mermaid
+flowchart TB
+    subgraph Caller["Caller trust domain"]
+        Client[Client with mTLS cert]
+    end
+
+    subgraph ProxyBoundary["carbide-bmc-proxy"]
+        MTLS[mTLS termination + SPIFFE/external cert authn]
+        ALLOW[principal allow-list]
+        LOOKUP[DB lookup: BMC IP -> BMC identity]
+        CREDS[credential lookup]
+        FORWARD[upstream HTTP proxy]
+    end
+
+    subgraph BMCBoundary["BMC"]
+        Redfish[Redfish / HTTPS]
+    end
+
+    Client --> MTLS --> ALLOW --> LOOKUP --> CREDS --> FORWARD --> Redfish
+```
+
+The caller authenticates with a client certificate. If the caller is authorized, carbide-bmc-proxy looks up the target BMC, retrieves the corresponding credentials, and performs the backend request itself.
+
+### Request Sequence
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Proxy as carbide-bmc-proxy
+    participant DB as Carbide DB
+    participant Vault as Secrets/Vault
+    participant BMC
+
+    Client->>Proxy: HTTPS + HTTP/2 + client cert
+    Client->>Proxy: GET /redfish/v1/...<br/>Forwarded: host=10.0.0.42
+    Proxy->>Proxy: authenticate + authorize principal
+    Proxy->>DB: resolve 10.0.0.42
+    DB-->>Proxy: BMC MAC / identity
+    Proxy->>Vault: get BMC credentials
+    Vault-->>Proxy: username/password
+    Proxy->>BMC: HTTPS request + Basic Auth
+    BMC-->>Proxy: Redfish response
+    Proxy-->>Client: proxied response
+```
 
 ## Future Direction
 
-This crate is meant to be a clean boundary, not the final word on implementation technology.
+This crate is meant to implement a clean architectural boundary, but the implementation still couples to carbide in slightly uncomfortable ways:
 
-If we later decide to move the proxying layer behind Envoy or another dedicated proxy stack, the core architectural idea should stay the same:
+1. It's still a component of the ncx-infra-controller-core repo, so it's not fully independent
+2. It expects a populated machine_interfaces table in the database in order to look up IP's to vault credential keys (which we rely on carbide-api to populate.)
+3. It expects populated credentials in vault for every BMC (which we rely on carbide-api to populate.)
 
-- callers authenticate once
-- BMC credentials remain centralized
-- Carbide is not forced to be the only BMC-facing system
-- peer systems consume a common access layer instead of each handling secrets independently
+Future work will focus on making carbide-bmc-proxy:
 
-That is the real value this crate is trying to establish.
+- Keep its own persisted configuration state, so that it can "own" IP-to-credentials lookups
+- Provide an admin/management API for setting/storing/rotating credentials
+
+At which point we can strip all BMC credential storage code out of carbide-api.
+
+[DPS]: https://docs.nvidia.com/datacenter/dps/versions/latest/
