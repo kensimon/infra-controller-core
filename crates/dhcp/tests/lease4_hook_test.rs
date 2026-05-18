@@ -207,40 +207,39 @@ fn lease4_select_overrides_rogue_option_50_in_memfile() -> Result<(), eyre::Repo
 }
 
 // And now the failure path. Carbide returns a Machine with no IPv4 address
-// (address=""). lease4_select must NOT allocate; specifically, the memfile
-// must end up with no active lease for the MAC.
-//
-// Note on Kea response behavior: NEXT_STEP_DROP at lease4_select stops the
-// allocation but Kea may still emit a response packet (NAK, or an OFFER with
-// yiaddr=0.0.0.0). Either is acceptable -- the resulting assertion here is
-// "no active memfile entry for the MAC", which is what protects the carbide
-// DB from getting garbage ExpireDhcpLease cleanup attempts later.
+// (address=""). pkt4_receive must drop before lease selection; specifically,
+// the REQUEST path must not create an active memfile lease for the MAC.
 #[test]
-fn lease4_select_drops_when_carbide_returns_no_address() -> Result<(), eyre::Report> {
+fn pkt4_receive_drops_when_carbide_returns_no_address() -> Result<(), eyre::Report> {
     let idx = 0x22;
+    let helper_idx = 0x24;
     let h = Harness::new(7104, 7105);
 
+    // Learn Kea's server identifier from a different MAC. The failure case
+    // below needs a SELECTING-state REQUEST so it exercises the persistence
+    // path, not just DISCOVER's fake allocation path.
+    let helper_offer = send_and_recv(&h.socket, DHCPFactory::discover(helper_idx))
+        .expect("kea did not respond to helper DISCOVER");
+    let server_id = server_identifier(&helper_offer);
+
     // Tell the mock to return an empty address for this MAC, which the API
-    // side translates to machine_get_interface_address()==0 -- the explicit
-    // "refuse to allocate" signal lease4_select checks.
+    // side translates to machine_get_interface_address()==0.
     h.api_server.set_address_override(&mac_for_idx(idx), "");
 
-    // Send a DISCOVER. We don't care what (if anything) comes back -- only
-    // that whatever does come back doesn't contain a real allocation, and
-    // that the memfile is unchanged.
-    let pkt = DHCPFactory::encode(DHCPFactory::discover(idx))?;
-    h.socket.send(&pkt)?;
-    let mut buf = [0u8; 1500];
-    if let Ok(n) = h.socket.recv(&mut buf) {
-        let msg = v4::Message::decode(&mut Decoder::new(&buf[..n])).unwrap();
+    // Send a REQUEST directly so this would be persisted if pkt4_receive did
+    // not stop processing before Kea's allocator.
+    if let Some(msg) = send_and_recv(
+        &h.socket,
+        request_selecting(idx, default_mock_addr(idx), server_id),
+    ) {
         let mtype = msg.opts().msg_type();
-        // If Kea did send a response, it must not be an OFFER with a usable
+        // If Kea did send a response, it must not be an ACK/OFFER with a usable
         // yiaddr (that would mean we allocated despite the drop).
-        if matches!(mtype, Some(v4::MessageType::Offer)) {
+        if matches!(mtype, Some(v4::MessageType::Ack | v4::MessageType::Offer)) {
             assert_eq!(
                 msg.yiaddr(),
                 Ipv4Addr::UNSPECIFIED,
-                "should not OFFER a real address when Carbide returned none, got {msg}"
+                "should not allocate a real address when Carbide returned none, got {msg}"
             );
         }
     }
