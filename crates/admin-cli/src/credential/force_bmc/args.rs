@@ -16,22 +16,10 @@
  */
 
 use ::rpc::forge::BmcCredentialRotationRequest;
-use ::rpc::forge::bmc_credential_rotation_request::{DeviceId, Mode};
-use carbide_uuid::machine::MachineId;
-use carbide_uuid::switch::SwitchId;
+use ::rpc::forge::bmc_credential_rotation_request::Mode;
+use carbide_uuid::device::DeviceId;
 use clap::Parser;
 use mac_address::MacAddress;
-
-/// Build the request's `device_id` oneof from the mutually-exclusive `--id` /
-/// `--switch-id` selectors (clap enforces at most one is present). Returns
-/// `None` when the target is addressed by `--bmc-mac` alone.
-fn device_id(id: Option<MachineId>, switch_id: Option<SwitchId>) -> Option<DeviceId> {
-    match (id, switch_id) {
-        (Some(id), _) => Some(DeviceId::MachineId(id)),
-        (None, Some(switch_id)) => Some(DeviceId::SwitchId(switch_id)),
-        (None, None) => None,
-    }
-}
 
 #[derive(Parser, Debug, Clone)]
 #[command(after_long_help = "\
@@ -77,23 +65,15 @@ pub struct ForceSet {
     #[clap(
         short,
         long,
-        required_unless_present_any = ["bmc_mac", "switch_id"],
-        conflicts_with = "switch_id",
-        help = "Machine ID that owns the BMC (a host machine or a DPU machine). \
-                Provide this, --switch-id, or --bmc-mac."
+        required_unless_present_any = ["bmc_mac"],
+        help = "ID of the Machine, DPU, or Switch that owns the BMC. Provide this or --bmc-mac."
     )]
-    pub id: Option<MachineId>,
+    pub id: Option<DeviceId>,
 
     #[clap(
         long,
-        help = "Switch ID that owns the BMC. Provide this, --id, or --bmc-mac."
-    )]
-    pub switch_id: Option<SwitchId>,
-
-    #[clap(
-        long,
-        help = "MAC of the BMC to target (machine or switch). Provide this, --id, \
-                or --switch-id; if an id is also given they must identify the same device."
+        help = "MAC of the BMC to target (machine or switch). Provide this \
+                or --id; if an id is also given they must identify the same device."
     )]
     pub bmc_mac: Option<MacAddress>,
 }
@@ -101,7 +81,8 @@ pub struct ForceSet {
 impl From<ForceSet> for BmcCredentialRotationRequest {
     fn from(args: ForceSet) -> Self {
         Self {
-            device_id: device_id(args.id, args.switch_id),
+            device_id: args.id,
+            machine_id: None,
             mode: Mode::Set as i32,
             bmc_mac: args.bmc_mac.map(|mac| mac.to_string()),
         }
@@ -126,19 +107,12 @@ pub struct ForceClear {
     #[clap(
         short,
         long,
-        required_unless_present_any = ["bmc_mac", "switch_id"],
+        required_unless_present_any = ["bmc_mac"],
         conflicts_with = "switch_id",
-        help = "Machine ID whose pending BMC force-converge request should be cleared. \
-                Provide this, --switch-id, or --bmc-mac."
+        help = "Machine or Switch ID whose pending BMC force-converge request should be cleared. \
+                Provide this or --bmc-mac."
     )]
-    pub id: Option<MachineId>,
-
-    #[clap(
-        long,
-        help = "Switch ID whose pending BMC force-converge request should be cleared. \
-                Provide this, --id, or --bmc-mac."
-    )]
-    pub switch_id: Option<SwitchId>,
+    pub id: Option<DeviceId>,
 
     #[clap(long, help = "MAC of the BMC whose pending request should be cleared.")]
     pub bmc_mac: Option<MacAddress>,
@@ -147,7 +121,8 @@ pub struct ForceClear {
 impl From<ForceClear> for BmcCredentialRotationRequest {
     fn from(args: ForceClear) -> Self {
         Self {
-            device_id: device_id(args.id, args.switch_id),
+            device_id: args.id,
+            machine_id: None,
             mode: Mode::Clear as i32,
             bmc_mac: args.bmc_mac.map(|mac| mac.to_string()),
         }
