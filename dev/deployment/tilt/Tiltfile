@@ -497,7 +497,7 @@ prerequisite(
     version='3.2.1',
     values=observability_values['tempo'],
     repo='repo-grafana-community',
-    resource_deps=['nico-observability-namespace'],
+    resource_deps=['nico-observability-namespace', 'prometheus'],
     labels=['observability'],
 )
 prerequisite(

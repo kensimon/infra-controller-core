@@ -75,7 +75,10 @@ ServiceMonitors, and operation traces export to Tempo as
 in the hardware-health values take precedence over the local Tempo default.
 Without that profile, neither ServiceMonitor is installed and Tilt adds no trace
 endpoint. See [hardware-health tracing](../../../docs/observability/tracing.md#nico-hardware-health-tracing)
-for sampling and span coverage.
+for sampling and span coverage. Health samples 1% of new traces by default; BMC
+HTTP spans additionally require `NICO_TRACES_SPAN_LEVEL=debug`. Set standard
+`OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG` variables under
+`nico-hardware-health.env` to override sampling, then trigger the health resource.
 
 ## NICo PostgreSQL dashboard
 
@@ -222,6 +225,33 @@ up{namespace="nico-system"}
 Prometheus stores metrics on a 2 GiB persistent volume and retains them for 24
 hours. Its UI at `http://localhost:19090` also shows discovered endpoints under
 **Status > Targets**.
+
+## Tempo monitoring
+
+The observability profile installs Tempo's ServiceMonitor, scraping `/metrics`
+every 30 seconds. Prometheus evaluates `TempoDown` after two minutes of failed
+or missing scrapes, `TempoDiscardingSpans` after two minutes of a positive five-minute discard
+rate (grouped by reason), and `TempoLiveTraceLimitPressure` after five minutes
+above 80% of the configured positive live-trace limit. These rules appear in the
+Prometheus **Alerts** UI; Alertmanager is disabled in this local profile, so they
+do not send notifications. Live-trace pressure compares each instance's busiest
+tenant with the default limit; per-tenant limit overrides require adapting the rule.
+
+Useful Prometheus queries:
+
+```promql
+up{job="tempo"}
+sum by (reason) (rate(tempo_discarded_spans_total[5m]))
+rate(tempo_distributor_spans_received_total[5m])
+rate(tempo_distributor_bytes_received_total[5m])
+tempo_live_store_live_traces
+process_resident_memory_bytes{job="tempo"}
+```
+
+Tempo's generated span metrics and service graphs count sampled traffic. Use
+application metrics for total request counts and failure rates. Head sampling
+reduces source export volume but can omit errors; this profile does not deploy
+a tail-sampling collector.
 
 ## Dashboards
 
