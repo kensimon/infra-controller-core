@@ -32,7 +32,7 @@ The default stack includes:
 - cert-manager
 - the CloudNativePG operator and one PostgreSQL cluster
 - Vault in local development mode
-- NICo API, BMC proxy, DHCP server, machine-a-tron, and mat-k8s-controller
+- NICo API, BMC proxy, DHCP server, hardware health, machine-a-tron, and mat-k8s-controller
 - Temporal and its local namespaces
 - Keycloak and the `nico-dev` realm
 - NICo REST API, database migrations, certificate manager, site manager,
@@ -45,6 +45,8 @@ Tilt forwards these endpoints:
 | Service | URL |
 | --- | --- |
 | NICo Web UI | `https://localhost:1079/admin/` |
+| Hardware health metrics | `http://localhost:9009/metrics` |
+| Hardware sensor telemetry | `http://localhost:9009/telemetry` |
 | Machine-A-Tron UI | `https://localhost:1266/` |
 | REST API | `http://localhost:18388` |
 | Keycloak | `http://localhost:18082` |
@@ -52,6 +54,28 @@ Tilt forwards these endpoints:
 | Temporal UI | `http://localhost:18233` |
 | Grafana | `http://localhost:13000` |
 | Prometheus | `http://localhost:19090` |
+
+## Hardware health
+
+`nico-hardware-health` is a core resource with manual updates, like `nico-api` and
+machine-a-tron. It discovers inventory and BMC credentials through NICo API using
+the certificate issued by the existing hardware-health chart. The MAT controller
+publishes simulated BMC IPs as Kubernetes Service external IPs, allowing direct
+Redfish connections without a `bmc_proxy_url` override.
+
+The local values enable sensor collection, automatic SSE/periodic log collection,
+and Prometheus output. The tracing sink writes collected sensor and log events
+to the Tilt log. NICo API keeps hardware reports in `MonitorOnly` mode. Supported sensors and log sources depend on the mock's
+hardware model; the GB200 host mock includes sensors and a Redfish EventService.
+Switch gNMI and NMX collectors are not enabled by this configuration.
+
+With `--observability=true`, both `/metrics` and `/telemetry` are scraped through
+ServiceMonitors, and operation traces export to Tempo as
+`service.name=nico-hardware-health`. Explicit OTEL endpoint environment variables
+in the hardware-health values take precedence over the local Tempo default.
+Without that profile, neither ServiceMonitor is installed and Tilt adds no trace
+endpoint. See [hardware-health tracing](../../../docs/observability/tracing.md#nico-hardware-health-tracing)
+for sampling and span coverage.
 
 ## NICo PostgreSQL dashboard
 

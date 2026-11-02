@@ -91,6 +91,15 @@ RUN --mount=type=cache,id=nico-dev-cargo-home-${TARGETARCH},target=/cargo-home,s
     && mkdir -p /out \
     && sha256sum </cargo-target/debug/libdhcp.so >/out/libdhcp.so.sha256sum
 
+# hardware-health builder
+FROM source AS hardware-health-builder
+
+RUN --mount=type=cache,id=nico-dev-cargo-home-${TARGETARCH},target=/cargo-home,sharing=locked \
+    --mount=type=cache,id=nico-dev-cargo-target-${TARGETARCH},target=/cargo-target,sharing=locked \
+    cargo build --locked -p carbide-health --bin forge-hw-health \
+    && mkdir -p /out \
+    && sha256sum </cargo-target/debug/forge-hw-health >/out/forge-hw-health.sha256sum
+
 # machine-a-tron builder
 FROM source AS machine-a-tron-builder
 
@@ -200,6 +209,21 @@ RUN --mount=type=cache,id=nico-dev-cargo-home-${TARGETARCH},target=/cargo-home,s
     cp /cargo-target/debug/libdhcp.so /usr/lib/kea/hooks/libdhcp.so \
     && test "$(sha256sum < /usr/lib/kea/hooks/libdhcp.so)" = "$(cat /tmp/libdhcp.so.sha256sum)" \
     && rm /tmp/libdhcp.so.sha256sum
+
+# hardware-health runtime image
+FROM ${CONTAINER_RUNTIME} AS hardware-health
+
+ARG TARGETARCH
+
+RUN mkdir -p /opt/carbide
+
+COPY --from=hardware-health-builder /out/forge-hw-health.sha256sum /tmp/forge-hw-health.sha256sum
+
+RUN --mount=type=cache,id=nico-dev-cargo-home-${TARGETARCH},target=/cargo-home,sharing=locked \
+    --mount=type=cache,id=nico-dev-cargo-target-${TARGETARCH},target=/cargo-target,sharing=locked \
+    cp /cargo-target/debug/forge-hw-health /opt/carbide/forge-hw-health \
+    && test "$(sha256sum < /opt/carbide/forge-hw-health)" = "$(cat /tmp/forge-hw-health.sha256sum)" \
+    && rm /tmp/forge-hw-health.sha256sum
 
 # machine-a-tron runtime image
 FROM ${CONTAINER_RUNTIME} AS machine-a-tron

@@ -976,6 +976,7 @@ core_images = [
     ('nico-api', 'api'),
     ('nico-bmc-proxy', 'bmc-proxy'),
     ('nico-dhcp', 'dhcp'),
+    ('nico-hardware-health', 'hardware-health'),
     ('machine-a-tron', 'machine-a-tron'),
     ('nico-ssh-console', 'ssh-console'),
 ]
@@ -1289,6 +1290,31 @@ helm_chart(
     manual=True,
 )
 
+hardware_health_values = component_values(core_global, all_values['nico-hardware-health'])
+hardware_health_values['serviceMonitor'] = {'enabled': enable_observability}
+hardware_health_values['telemetryServiceMonitor'] = {'enabled': enable_observability}
+hardware_health_dependencies = ['nico-api', 'nico-machine-a-tron']
+if enable_observability:
+    health_env = hardware_health_values.setdefault('env', {})
+    if not (health_env.get('OTEL_EXPORTER_OTLP_TRACES_ENDPOINT') or health_env.get('OTEL_EXPORTER_OTLP_ENDPOINT')):
+        health_env['OTEL_EXPORTER_OTLP_TRACES_ENDPOINT'] = 'http://tempo.%s.svc.cluster.local:4317' % observability_namespace
+    hardware_health_dependencies.extend(['prometheus', 'tempo'])
+helm_chart(
+    name='nico-hardware-health',
+    chart=os.path.join(core_charts, 'nico-hardware-health'),
+    namespace=core_namespace,
+    values=hardware_health_values,
+    resource_deps=hardware_health_dependencies,
+    image_deps=['nico-hardware-health'],
+    image_keys=[('global.image.repository', 'global.image.tag')],
+    port_forwards=[port_forward(9009, 9009)],
+    links=[
+        link('http://localhost:9009/metrics', 'Hardware Health Metrics'),
+        link('http://localhost:9009/telemetry', 'Hardware Telemetry'),
+    ],
+    manual=True,
+)
+
 ssh_console_values = component_values(core_global, all_values['nico-ssh-console-rs'])
 ssh_console_values['serviceMonitor'] = {'enabled': enable_observability}
 helm_chart(
@@ -1457,6 +1483,7 @@ enabled_resources = [
     'nico-machine-a-tron-dhcp-relay',
     'nico-machine-a-tron',
     'nico-machine-a-tron-ssh',
+    'nico-hardware-health',
     'nico-ssh-console-rs',
 ]
 if enable_observability:

@@ -225,6 +225,18 @@ nico-ssh-console-rs:
       console_logging_enabled = true
       console_logs_path = "/var/log/consoles"
 
+nico-hardware-health:
+  replicas: 1
+  env:
+    # API discovery supplies inventory and credentials. MAT's controller routes
+    # each discovered BMC IP directly to its mock; no bmc_proxy_url is needed.
+    CARBIDE_HEALTH__ENDPOINT_SOURCES__NICO_API__ENABLED: "true"
+    CARBIDE_HEALTH__COLLECTORS__SENSORS__ENABLED: "true"
+    CARBIDE_HEALTH__COLLECTORS__LOGS__ENABLED: "true"
+    CARBIDE_HEALTH__COLLECTORS__LOGS__MODE: "auto"
+    CARBIDE_HEALTH__SINKS__PROMETHEUS__ENABLED: "true"
+    CARBIDE_HEALTH__SINKS__TRACING__ENABLED: "true"
+
 nico-machine-a-tron:
   enabled: true
   machineATron:
