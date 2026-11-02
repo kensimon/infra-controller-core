@@ -621,6 +621,10 @@ tilt:
           remoteWriteUrl: http://prometheus-stack-prometheus.observability.svc.cluster.local:9090/api/v1/write
         overrides:
           defaults:
+            # Local API/proxy traffic can exceed 10,000 concurrent live traces.
+            # Keep a finite cap and monitor pressure; this is not fleet sizing.
+            ingestion:
+              max_traces_per_user: 50000
             metrics_generator:
               processors:
                 - service-graphs

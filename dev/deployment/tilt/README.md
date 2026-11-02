@@ -237,6 +237,12 @@ Prometheus **Alerts** UI; Alertmanager is disabled in this local profile, so the
 do not send notifications. Live-trace pressure compares each instance's busiest
 tenant with the default limit; per-tenant limit overrides require adapting the rule.
 
+Tilt sets `tempo.overrides.defaults.ingestion.max_traces_per_user` to `50000`
+under `tilt.observability.tempo`. This finite per-tenant, per-instance cap provides
+headroom for local API and proxy traffic that exceeds Tempo's 10,000-trace
+default. It is a development capacity setting, not a production fleet sizing
+recommendation. Use the pressure/discard metrics and memory usage when adjusting it.
+
 Useful Prometheus queries:
 
 ```promql
