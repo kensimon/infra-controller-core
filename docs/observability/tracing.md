@@ -320,7 +320,8 @@ Restart the service after changing tracing environment variables.
 
 `NICO_TRACES_SPAN_LEVEL` controls span filtering independently of `RUST_LOG`, defaulting to `info`.
 It accepts `off`, `error`, `warn`, `info`, `debug`, `trace`, or `0`–`5`; invalid values warn and use
-`info`. All hardware-health operation spans are INFO, so `off`, `error`, or `warn` suppress them.
+`info`. BMC HTTP spans are DEBUG and require `NICO_TRACES_SPAN_LEVEL=debug` (or `trace`).
+Summary and API client spans are INFO; `off`, `error`, or `warn` suppress them.
 Standard `OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG` settings control sampling. For example,
 `parentbased_traceidratio` with argument `0.01` samples approximately one percent of operations.
 Without sampling overrides, the shared helper uses the SDK default sampler. Sampling every poll

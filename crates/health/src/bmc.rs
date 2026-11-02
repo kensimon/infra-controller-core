@@ -1195,7 +1195,7 @@ impl InstrumentedHttpClient {
         future: impl Future<Output = Result<T, BmcError>>,
         status_code: impl FnOnce(&Result<T, BmcError>) -> Option<u16>,
     ) -> (Result<T, BmcError>, Duration) {
-        let span = tracing::info_span!(
+        let span = tracing::debug_span!(
             "nv_redfish_http",
             otel.kind = "client",
             http.request.method = method,

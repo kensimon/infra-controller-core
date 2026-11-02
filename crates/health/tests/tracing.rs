@@ -45,6 +45,13 @@ impl TraceService for Receiver {
 #[tokio::test]
 async fn binary_exports_spans_with_logs_off_and_flushes_on_sigterm()
 -> Result<(), Box<dyn std::error::Error>> {
+    for level in ["info", "debug"] {
+        check_binary_export(level).await?;
+    }
+    Ok(())
+}
+
+async fn check_binary_export(level: &str) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let otlp_address = listener.local_addr()?;
     let cancel = CancellationToken::new();
@@ -137,7 +144,7 @@ async fn binary_exports_spans_with_logs_off_and_flushes_on_sigterm()
             format!("http://{otlp_address}"),
         )
         .env("OTEL_TRACES_SAMPLER", "always_on")
-        .env("NICO_TRACES_SPAN_LEVEL", "info")
+        .env("NICO_TRACES_SPAN_LEVEL", level)
         .env("OTEL_BSP_SCHEDULE_DELAY", "600000")
         .env("OTEL_BSP_MAX_EXPORT_BATCH_SIZE", "2048")
         .kill_on_drop(true)
@@ -188,16 +195,16 @@ async fn binary_exports_spans_with_logs_off_and_flushes_on_sigterm()
         .collect();
     assert!(spans.iter().any(|span| span.name == "health_collection"));
     assert!(spans.iter().any(|span| span.name == "health_discovery"));
-    let bmc_span = spans
-        .iter()
-        .find(|span| span.name == "nv_redfish_http")
-        .expect("BMC HTTP spans export with logs off");
-    assert!(
-        spans
-            .iter()
-            .any(|parent| parent.span_id == bmc_span.parent_span_id
-                && parent.trace_id == bmc_span.trace_id)
-    );
+    let bmc_span = spans.iter().find(|span| span.name == "nv_redfish_http");
+    assert_eq!(bmc_span.is_some(), level == "debug", "span level {level}");
+    if let Some(bmc_span) = bmc_span {
+        assert!(
+            spans
+                .iter()
+                .any(|parent| parent.span_id == bmc_span.parent_span_id
+                    && parent.trace_id == bmc_span.trace_id)
+        );
+    }
     let rpc = spans
         .iter()
         .find(|span| span.name == "grpc_client_request")

@@ -76,6 +76,7 @@ stream lifetimes separate from the request spans.
 Set `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` to an OTLP/gRPC collector endpoint before starting the
 service. `OTEL_EXPORTER_OTLP_ENDPOINT` is the fallback; with neither variable set, span export stays
 off. `NICO_TRACES_SPAN_LEVEL` defaults to `info` and filters spans independently of `RUST_LOG`.
+BMC HTTP spans require `NICO_TRACES_SPAN_LEVEL=debug`; summary and API spans remain at INFO.
 Standard `OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG` settings control sampling. Tracing settings
 require a restart. There are no additional TOML settings.
 
