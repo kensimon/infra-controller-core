@@ -2411,6 +2411,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "trace-propagation",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",

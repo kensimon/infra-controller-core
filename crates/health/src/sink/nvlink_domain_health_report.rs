@@ -26,13 +26,14 @@ use std::sync::Arc;
 use carbide_instrument::{Instrumentation, Outcome};
 use carbide_uuid::nvlink::NvLinkDomainId;
 use tokio_util::sync::CancellationToken;
+use tracing::instrument::WithSubscriber;
 
 use super::dedup_queue::DedupQueue;
+use super::queued_health_report::QueuedHealthReport;
 use super::report_worker::run_report_worker;
 use super::shutdown::{DeliveryCounts, SinkWorkers};
 use super::{
-    CollectorEvent, DataSink, EventContext, HealthReport, HealthReportSubmitted,
-    HealthReportTarget, ReportSource,
+    CollectorEvent, DataSink, EventContext, HealthReportSubmitted, HealthReportTarget, ReportSource,
 };
 use crate::HealthError;
 use crate::api_client::ApiClientWrapper;
@@ -48,7 +49,7 @@ const SINK_TYPE: &str = "nvlink_domain_health_report_sink";
 
 /// Submits `NvLinkDomain`-target health reports to the NICo API.
 pub struct NvLinkDomainHealthReportSink {
-    queue: Arc<DedupQueue<NvLinkDomainHealthReportKey, Arc<HealthReport>>>,
+    queue: Arc<DedupQueue<NvLinkDomainHealthReportKey, QueuedHealthReport>>,
     cancel_token: CancellationToken,
 }
 
@@ -77,7 +78,7 @@ impl NvLinkDomainHealthReportSink {
             instrumentation.clone(),
         ));
 
-        let queue: Arc<DedupQueue<NvLinkDomainHealthReportKey, Arc<HealthReport>>> =
+        let queue: Arc<DedupQueue<NvLinkDomainHealthReportKey, QueuedHealthReport>> =
             Arc::new(DedupQueue::new());
 
         let cancel_token = CancellationToken::new();
@@ -96,9 +97,12 @@ impl NvLinkDomainHealthReportSink {
             },
         );
 
-        let worker = handle.spawn(async move {
-            worker_cancel_token.run_until_cancelled(worker).await;
-        });
+        let worker = handle.spawn(
+            async move {
+                worker_cancel_token.run_until_cancelled(worker).await;
+            }
+            .with_current_subscriber(),
+        );
 
         let queued = Arc::clone(&queue);
         sink_workers.register(SINK_TYPE, None, move || queued.len(), counts, vec![worker]);
@@ -114,12 +118,16 @@ async fn submit_report(
     client: Arc<ApiClientWrapper>,
     instrumentation: Instrumentation,
     key: NvLinkDomainHealthReportKey,
-    report: Arc<HealthReport>,
+    report: QueuedHealthReport,
 ) -> bool {
-    match report.as_ref().try_into() {
+    match report.report.as_ref().try_into() {
         Ok(converted) => {
-            let result = client
-                .submit_nvlink_domain_health_report(&key.id, converted)
+            let result = report
+                .submit(
+                    HealthReportTarget::NvLinkDomain,
+                    &key.id,
+                    client.submit_nvlink_domain_health_report(&key.id, converted),
+                )
                 .await;
 
             let delivered = result.is_ok();
@@ -189,7 +197,8 @@ impl DataSink for NvLinkDomainHealthReportSink {
             source: report.source,
         };
 
-        self.queue.save_latest(key, Arc::clone(report));
+        self.queue
+            .save_latest(key, QueuedHealthReport::new(Arc::clone(report)));
 
         Ok(())
     }
@@ -205,7 +214,7 @@ mod tests {
 
     use super::*;
     use crate::endpoint::{BmcAddr, EndpointMetadata, SwitchData, SwitchEndpointRole};
-    use crate::sink::{HealthReportAlert, HealthReportSuccess, Probe};
+    use crate::sink::{HealthReport, HealthReportAlert, HealthReportSuccess, Probe};
 
     #[test]
     fn queued_recovery_replaces_alert_for_the_same_domain_source() {
@@ -279,8 +288,8 @@ mod tests {
 
         assert_eq!(key.id, domain_id);
         assert_eq!(key.source, ReportSource::NmxcDomainState);
-        assert!(report.alerts.is_empty());
-        assert_eq!(report.successes.len(), 1);
+        assert!(report.report.alerts.is_empty());
+        assert_eq!(report.report.successes.len(), 1);
         assert!(queue.pop().is_none());
     }
 

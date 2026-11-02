@@ -19,13 +19,14 @@ use std::sync::Arc;
 
 use carbide_instrument::{Instrumentation, Outcome};
 use carbide_uuid::switch::SwitchId;
+use tracing::instrument::WithSubscriber;
 
 use super::dedup_queue::DedupQueue;
+use super::queued_health_report::QueuedHealthReport;
 use super::report_worker::run_report_worker;
 use super::shutdown::{DeliveryCounts, SinkWorkers};
 use super::{
-    CollectorEvent, DataSink, EventContext, HealthReport, HealthReportSubmitted,
-    HealthReportTarget, ReportSource,
+    CollectorEvent, DataSink, EventContext, HealthReportSubmitted, HealthReportTarget, ReportSource,
 };
 use crate::HealthError;
 use crate::api_client::ApiClientWrapper;
@@ -40,7 +41,7 @@ struct SwitchHealthReportKey {
 const SINK_TYPE: &str = "switch_health_report_sink";
 
 pub struct SwitchHealthReportSink {
-    queue: Arc<DedupQueue<SwitchHealthReportKey, Arc<HealthReport>>>,
+    queue: Arc<DedupQueue<SwitchHealthReportKey, QueuedHealthReport>>,
     skip_empty_reports: bool,
 }
 
@@ -69,7 +70,7 @@ impl SwitchHealthReportSink {
             instrumentation.clone(),
         ));
 
-        let queue: Arc<DedupQueue<SwitchHealthReportKey, Arc<HealthReport>>> =
+        let queue: Arc<DedupQueue<SwitchHealthReportKey, QueuedHealthReport>> =
             Arc::new(DedupQueue::new());
 
         let counts = DeliveryCounts::default();
@@ -78,20 +79,23 @@ impl SwitchHealthReportSink {
             .map(|worker_id| {
                 let client = Arc::clone(&client);
                 let instrumentation = instrumentation.clone();
-                handle.spawn(run_report_worker(
-                    Arc::clone(&queue),
-                    counts.clone(),
-                    sink_workers.flush_token(),
-                    move |key, report| {
-                        submit_report(
-                            Arc::clone(&client),
-                            instrumentation.clone(),
-                            worker_id,
-                            key,
-                            report,
-                        )
-                    },
-                ))
+                handle.spawn(
+                    run_report_worker(
+                        Arc::clone(&queue),
+                        counts.clone(),
+                        sink_workers.flush_token(),
+                        move |key, report| {
+                            submit_report(
+                                Arc::clone(&client),
+                                instrumentation.clone(),
+                                worker_id,
+                                key,
+                                report,
+                            )
+                        },
+                    )
+                    .with_current_subscriber(),
+                )
             })
             .collect();
 
@@ -110,11 +114,17 @@ async fn submit_report(
     instrumentation: Instrumentation,
     worker_id: usize,
     key: SwitchHealthReportKey,
-    report: Arc<HealthReport>,
+    report: QueuedHealthReport,
 ) -> bool {
-    match report.as_ref().try_into() {
+    match report.report.as_ref().try_into() {
         Ok(converted) => {
-            let result = client.submit_switch_health_report(&key.id, converted).await;
+            let result = report
+                .submit(
+                    HealthReportTarget::Switch,
+                    &key.id,
+                    client.submit_switch_health_report(&key.id, converted),
+                )
+                .await;
             let delivered = result.is_ok();
 
             instrumentation.emit(HealthReportSubmitted {
@@ -182,7 +192,8 @@ impl DataSink for SwitchHealthReportSink {
             id: switch_id,
             source: report.source,
         };
-        self.queue.save_latest(key, Arc::clone(report));
+        self.queue
+            .save_latest(key, QueuedHealthReport::new(Arc::clone(report)));
 
         Ok(())
     }

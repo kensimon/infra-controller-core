@@ -71,6 +71,44 @@ pub async fn run_discovery_iteration(
     data_sink: Option<Arc<dyn DataSink>>,
     metrics_prefix: &str,
 ) -> Result<DiscoveryIterationStats, HealthError> {
+    let span = tracing::info_span!(
+        parent: None, "health_discovery",
+        discovered_endpoint_count = tracing::field::Empty,
+        sharded_endpoint_count = tracing::field::Empty,
+        active_monitor_count = tracing::field::Empty,
+        outcome = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
+        logfmt.suppress = true,
+    );
+    crate::operation_tracing::operation(
+        span,
+        run_discovery_iteration_inner(
+            endpoint_source,
+            shard_manager,
+            ctx,
+            data_sink,
+            metrics_prefix,
+        ),
+        |result| {
+            if let Ok(stats) = result {
+                let span = tracing::Span::current();
+                span.record("discovered_endpoint_count", stats.discovered_endpoints);
+                span.record("sharded_endpoint_count", stats.sharded_endpoints);
+                span.record("active_monitor_count", stats.active_monitors);
+            }
+            crate::operation_tracing::Outcome::from(result)
+        },
+    )
+    .await
+}
+
+async fn run_discovery_iteration_inner(
+    endpoint_source: Arc<dyn EndpointSource>,
+    shard_manager: &ShardManager,
+    ctx: &mut DiscoveryLoopContext,
+    data_sink: Option<Arc<dyn DataSink>>,
+    metrics_prefix: &str,
+) -> Result<DiscoveryIterationStats, HealthError> {
     let iteration_start = Instant::now();
 
     let fetch_start = Instant::now();

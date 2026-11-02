@@ -108,9 +108,10 @@ pub(crate) mod tests {
                     .with_tracer(provider.tracer("hardware-health-test"))
                     .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
                         metadata.is_span()
-                            && metadata
-                                .module_path()
-                                .is_some_and(|path| path.starts_with("carbide_health::"))
+                            && metadata.module_path().is_some_and(|path| {
+                                path.starts_with("carbide_health::")
+                                    || path == "rpc::grpc_client_tracing"
+                            })
                     })),
             );
             Self {

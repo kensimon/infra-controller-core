@@ -19,13 +19,14 @@ use std::sync::Arc;
 
 use carbide_instrument::{Instrumentation, Outcome};
 use carbide_uuid::power_shelf::PowerShelfId;
+use tracing::instrument::WithSubscriber;
 
 use super::dedup_queue::DedupQueue;
+use super::queued_health_report::QueuedHealthReport;
 use super::report_worker::run_report_worker;
 use super::shutdown::{DeliveryCounts, SinkWorkers};
 use super::{
-    CollectorEvent, DataSink, EventContext, HealthReport, HealthReportSubmitted,
-    HealthReportTarget, ReportSource,
+    CollectorEvent, DataSink, EventContext, HealthReportSubmitted, HealthReportTarget, ReportSource,
 };
 use crate::HealthError;
 use crate::api_client::ApiClientWrapper;
@@ -40,7 +41,7 @@ struct PowerShelfHealthReportKey {
 const SINK_TYPE: &str = "power_shelf_health_report_sink";
 
 pub struct PowerShelfHealthReportSink {
-    queue: Arc<DedupQueue<PowerShelfHealthReportKey, Arc<HealthReport>>>,
+    queue: Arc<DedupQueue<PowerShelfHealthReportKey, QueuedHealthReport>>,
     skip_empty_reports: bool,
 }
 
@@ -69,7 +70,7 @@ impl PowerShelfHealthReportSink {
             instrumentation.clone(),
         ));
 
-        let queue: Arc<DedupQueue<PowerShelfHealthReportKey, Arc<HealthReport>>> =
+        let queue: Arc<DedupQueue<PowerShelfHealthReportKey, QueuedHealthReport>> =
             Arc::new(DedupQueue::new());
 
         let counts = DeliveryCounts::default();
@@ -78,20 +79,23 @@ impl PowerShelfHealthReportSink {
             .map(|worker_id| {
                 let client = Arc::clone(&client);
                 let instrumentation = instrumentation.clone();
-                handle.spawn(run_report_worker(
-                    Arc::clone(&queue),
-                    counts.clone(),
-                    sink_workers.flush_token(),
-                    move |key, report| {
-                        submit_report(
-                            Arc::clone(&client),
-                            instrumentation.clone(),
-                            worker_id,
-                            key,
-                            report,
-                        )
-                    },
-                ))
+                handle.spawn(
+                    run_report_worker(
+                        Arc::clone(&queue),
+                        counts.clone(),
+                        sink_workers.flush_token(),
+                        move |key, report| {
+                            submit_report(
+                                Arc::clone(&client),
+                                instrumentation.clone(),
+                                worker_id,
+                                key,
+                                report,
+                            )
+                        },
+                    )
+                    .with_current_subscriber(),
+                )
             })
             .collect();
 
@@ -110,12 +114,16 @@ async fn submit_report(
     instrumentation: Instrumentation,
     worker_id: usize,
     key: PowerShelfHealthReportKey,
-    report: Arc<HealthReport>,
+    report: QueuedHealthReport,
 ) -> bool {
-    match report.as_ref().try_into() {
+    match report.report.as_ref().try_into() {
         Ok(converted) => {
-            let result = client
-                .submit_power_shelf_health_report(&key.id, converted)
+            let result = report
+                .submit(
+                    HealthReportTarget::PowerShelf,
+                    &key.id,
+                    client.submit_power_shelf_health_report(&key.id, converted),
+                )
                 .await;
 
             let delivered = result.is_ok();
@@ -185,7 +193,8 @@ impl DataSink for PowerShelfHealthReportSink {
             id: power_shelf_id,
             source: report.source,
         };
-        self.queue.save_latest(key, Arc::clone(report));
+        self.queue
+            .save_latest(key, QueuedHealthReport::new(Arc::clone(report)));
 
         Ok(())
     }

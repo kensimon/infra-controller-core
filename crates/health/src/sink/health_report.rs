@@ -23,8 +23,10 @@ use std::time::{Duration, Instant};
 
 use carbide_instrument::{Instrumentation, Outcome};
 use carbide_uuid::machine::MachineId;
+use tracing::instrument::WithSubscriber;
 
 use super::dedup_queue::DedupQueue;
+use super::queued_health_report::QueuedHealthReport;
 use super::report_worker::run_report_worker;
 use super::shutdown::{DeliveryCounts, SinkWorkers};
 use super::{
@@ -71,7 +73,7 @@ impl LastSentCache {
 const SINK_TYPE: &str = "health_report_sink";
 
 pub struct HealthReportSink {
-    queue: Arc<DedupQueue<HealthReportKey, Arc<HealthReport>>>,
+    queue: Arc<DedupQueue<HealthReportKey, QueuedHealthReport>>,
     skip_empty_reports: bool,
     suppress_unchanged_interval: Option<Duration>,
     last_sent: Mutex<LastSentCache>,
@@ -115,7 +117,7 @@ impl HealthReportSink {
             instrumentation.clone(),
         ));
 
-        let queue: Arc<DedupQueue<HealthReportKey, Arc<HealthReport>>> =
+        let queue: Arc<DedupQueue<HealthReportKey, QueuedHealthReport>> =
             Arc::new(DedupQueue::new());
 
         let counts = DeliveryCounts::default();
@@ -124,20 +126,23 @@ impl HealthReportSink {
             .map(|worker_id| {
                 let client = Arc::clone(&client);
                 let instrumentation = instrumentation.clone();
-                handle.spawn(run_report_worker(
-                    Arc::clone(&queue),
-                    counts.clone(),
-                    sink_workers.flush_token(),
-                    move |key, report| {
-                        submit_report(
-                            Arc::clone(&client),
-                            instrumentation.clone(),
-                            worker_id,
-                            key,
-                            report,
-                        )
-                    },
-                ))
+                handle.spawn(
+                    run_report_worker(
+                        Arc::clone(&queue),
+                        counts.clone(),
+                        sink_workers.flush_token(),
+                        move |key, report| {
+                            submit_report(
+                                Arc::clone(&client),
+                                instrumentation.clone(),
+                                worker_id,
+                                key,
+                                report,
+                            )
+                        },
+                    )
+                    .with_current_subscriber(),
+                )
             })
             .collect();
 
@@ -164,7 +169,9 @@ impl HealthReportSink {
 
     #[cfg(feature = "bench-hooks")]
     pub fn pop_pending_for_bench(&self) -> Option<(MachineId, Arc<HealthReport>)> {
-        self.queue.pop().map(|(key, report)| (key.id, report))
+        self.queue
+            .pop()
+            .map(|(key, report)| (key.id, report.report))
     }
 
     #[cfg(feature = "bench-hooks")]
@@ -178,11 +185,17 @@ async fn submit_report(
     instrumentation: Instrumentation,
     worker_id: usize,
     key: HealthReportKey,
-    report: Arc<HealthReport>,
+    report: QueuedHealthReport,
 ) -> bool {
-    match report.as_ref().try_into() {
+    match report.report.as_ref().try_into() {
         Ok(converted) => {
-            let result = client.submit_health_report(&key.id, converted).await;
+            let result = report
+                .submit(
+                    HealthReportTarget::Machine,
+                    &key.id,
+                    client.submit_health_report(&key.id, converted),
+                )
+                .await;
             let delivered = result.is_ok();
 
             instrumentation.emit(HealthReportSubmitted {
@@ -270,7 +283,8 @@ impl DataSink for HealthReportSink {
                 }
             }
 
-            self.queue.save_latest(key, Arc::clone(report));
+            self.queue
+                .save_latest(key, QueuedHealthReport::new(Arc::clone(report)));
             Ok(())
         } else {
             tracing::warn!(
@@ -314,7 +328,7 @@ mod tests {
         })
     }
 
-    fn machine_context(id: MachineId) -> EventContext {
+    pub(super) fn machine_context(id: MachineId) -> EventContext {
         EventContext {
             endpoint_key: "00:00:00:00:00:01".to_string(),
             addr: BmcAddr {
@@ -337,7 +351,7 @@ mod tests {
         }
     }
 
-    fn success_report(source: ReportSource) -> Arc<HealthReport> {
+    pub(super) fn success_report(source: ReportSource) -> Arc<HealthReport> {
         Arc::new(HealthReport {
             source,
             target: Some(HealthReportTarget::Machine),
@@ -530,5 +544,153 @@ mod tests {
             sink.queue.pop().is_some(),
             "with suppression disabled all sends should go through"
         );
+    }
+}
+
+#[cfg(test)]
+mod tracing_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use opentelemetry::trace::TraceContextExt;
+    use tracing::instrument::WithSubscriber;
+    use tracing::{Instrument, Span};
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+    use super::*;
+    use crate::operation_tracing::tests::{SpanCapture, attribute};
+
+    #[tokio::test]
+    async fn queued_report_replacement_carries_latest_parent_through_rpc() {
+        opentelemetry::global::set_text_map_propagator(
+            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+        );
+        for (scenario, code) in [("success", 0), ("failure", 3)] {
+            let capture = SpanCapture::new();
+            let dispatch = capture.dispatch.clone();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    axum::Router::new().fallback(move |request: axum::extract::Request| {
+                        let dispatch = dispatch.clone();
+                        async move {
+                            let span = tracing::info_span!(parent: None, "fake_api_server");
+                            trace_propagation::set_span_parent_from_headers(
+                                &span,
+                                request.headers(),
+                            );
+                            async move {
+                                let status = if request.uri().path().ends_with("/Version") {
+                                    0
+                                } else {
+                                    code
+                                };
+                                http::Response::builder()
+                                    .header("content-type", "application/grpc")
+                                    .header("grpc-status", status.to_string())
+                                    .body(axum::body::Body::from(vec![0_u8; 5]))
+                                    .unwrap()
+                            }
+                            .instrument(span)
+                            .await
+                        }
+                        .with_subscriber(dispatch)
+                    }),
+                )
+                .await
+                .unwrap();
+            });
+            async {
+                let mut config = HealthReportSinkConfig::default();
+                config.connection.api_url = format!("http://{address}").parse().unwrap();
+                config.workers = 1;
+                config.suppress_unchanged_interval = None;
+                let metrics = carbide_instrument::testing::MetricsCapture::owned();
+                let mut sink_workers = SinkWorkers::default();
+                let sink = HealthReportSink::new(
+                    &config,
+                    &mut sink_workers,
+                    metrics.instrumentation().clone(),
+                )
+                .unwrap();
+                let id = "fm100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0"
+                    .parse()
+                    .unwrap();
+                let context = super::tests::machine_context(id);
+                let report = super::tests::success_report(ReportSource::BmcSensors);
+                let mut newest_context = None;
+                // No await between enqueueing: the worker sees only the replacement.
+                for _ in 0..2 {
+                    let producer = tracing::info_span!(parent: None, "test_collection");
+                    let _entered = producer.enter();
+                    newest_context = Some(Span::current().context().span().span_context().clone());
+                    sink.try_handle_event(
+                        &context,
+                        &CollectorEvent::HealthReport(Arc::clone(&report)),
+                    )
+                    .unwrap();
+                }
+                assert_eq!(
+                    capture
+                        .spans()
+                        .iter()
+                        .filter(|s| s.name == "test_collection")
+                        .count(),
+                    2,
+                    "queueing must not retain open collection spans"
+                );
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !capture
+                        .spans()
+                        .iter()
+                        .any(|s| s.name == "health_report_submit")
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                let spans = capture.spans();
+                let submits: Vec<_> = spans
+                    .iter()
+                    .filter(|s| s.name == "health_report_submit")
+                    .collect();
+                assert_eq!(submits.len(), 1, "deduplicated report submits once");
+                let submit = submits[0];
+                let newest_context = newest_context.unwrap();
+                let parent = newest_context;
+                assert_eq!(
+                    submit.span_context.trace_id(),
+                    parent.trace_id(),
+                    "{scenario}"
+                );
+                assert_eq!(submit.parent_span_id, parent.span_id(), "{scenario}");
+                assert_eq!(
+                    attribute(submit, "outcome").as_deref(),
+                    Some(if code == 0 { "success" } else { "error" })
+                );
+                let rpc = spans
+                    .iter()
+                    .find(|s| {
+                        s.name == "grpc_client_request"
+                            && attribute(s, "rpc.method").as_deref()
+                                == Some("InsertMachineHealthReport")
+                    })
+                    .unwrap();
+                assert_eq!(rpc.parent_span_id, submit.span_context.span_id());
+                assert_eq!(
+                    attribute(rpc, "rpc.grpc.status_code"),
+                    Some(code.to_string())
+                );
+                assert!(spans.iter().any(|s| s.name == "fake_api_server"
+                    && s.parent_span_id == rpc.span_context.span_id()
+                    && s.span_context.trace_id() == parent.trace_id()));
+            }
+            .with_subscriber(capture.dispatch.clone())
+            .await;
+            server.abort();
+        }
     }
 }

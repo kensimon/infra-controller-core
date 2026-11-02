@@ -306,8 +306,9 @@ routes. It uses the shared setup in `carbide_instrument::otlp_tracing`, enabled 
 
 Hardware health exports finite operation spans with `service.name = nico-hardware-health`.
 Independent root spans are useful for investigating slow polling, export failures, and connection
-establishment even though this background collector has no incoming request context. They complement
-the existing metrics and logs; they do not represent an end-to-end hardware-event delivery trace.
+establishment even though this background collector has no incoming request context. API client spans
+and queued report submissions continue the producing operation's trace. These traces complement the
+existing metrics and logs; they do not represent an end-to-end hardware-event delivery trace.
 This implements the tracing option evaluated in [issue #5778](https://github.com/dsx-ai-factory/infra-controller/issues/5778).
 
 Span export is off unless a nonempty `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` or
@@ -327,21 +328,30 @@ can generate substantial trace volume across many targets; choose a ratio approp
 
 | Span | Boundary and fields |
 | --- | --- |
+| `health_discovery` | One discovery/reconciliation iteration, including NICo inventory API calls. Includes discovered and sharded endpoint counts and active sensor monitor count. |
+| `health_report_submit` | One queued health-report submission, parented to the operation that produced the latest queued report. Includes report target, target ID, and source. |
+| `grpc_client_request` | Shared NICo API client transport spans, including connection probes. Includes RPC service/method, HTTP response status, and gRPC status from headers or trailers. Context is propagated to NICo API server spans. |
 | `health_collection` | One periodic collector iteration, excluding rate-limit waits and interval sleeps. Includes collector type, endpoint address, refresh flag, optional entity count, and partial fetch failure count. |
 | `health_otlp_export` | One log or metric send attempt, including retries and split requests. Includes target address, signal, record count, zero-based attempt number, numeric gRPC status, and receiver rejection count on a response. |
 | `health_stream_connect` | One shared streaming collector connection attempt, ending when the stream is accepted or connection fails. Includes collector type and endpoint address. |
 | `health_gnmi_connect` | One gNMI channel establishment attempt, including TLS configuration. Includes switch ID and endpoint address. |
 | `health_otlp_connect` | One explicit replacement-channel attempt after OTLP TLS material reload, including TLS configuration. Includes target address. |
 
-Each operation starts its own trace and records `outcome` as `success`, `partial_success`, `error`,
-or `cancelled`. Partial collection failures and OTLP receiver partial-success responses use
+Collection, discovery, connection, and OTLP export operations start independent traces. Health-owned
+operation spans record `outcome` as `success`, `partial_success`, `error`, or `cancelled`. Partial collection failures and OTLP receiver partial-success responses use
 `partial_success`; failures, partial success, and cancellation set OpenTelemetry error status.
 Retries are separate traces, identified by their target, signal, and attempt number. Connection spans
 close before consuming a long-lived stream. Tonic's automatic transport reconnects and stream
 lifetimes are outside this coverage. These spans do not inject trace context into hardware requests.
 
-Only hardware-health spans are exported. Log events and dependency spans are excluded so hardware
-payloads and raw error messages are not attached to traces. OTLP target addresses omit URL credentials,
+Health-report queues carry only the producing span's trace identity, flags, and trace state, so
+queueing does not retain an open collection span. A newer report replaces both the queued payload
+and its parent context. Submission can start after collection ends. Submissions without producing
+context start a new trace. All five report targets use this behavior: machine, rack, switch, power
+shelf, and NVLink domain.
+
+Hardware-health spans and the shared RPC client's spans are exported. Log events and other dependency
+spans are excluded so hardware payloads and raw error messages are not attached to traces. OTLP target addresses omit URL credentials,
 paths, queries, and fragments; spans do not contain credentials or certificate material. Routine span
 closure does not add logfmt records. Existing operation logs keep their `RUST_LOG` filtering and can
 carry span correlation while the operation is active.

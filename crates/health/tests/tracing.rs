@@ -73,6 +73,38 @@ async fn binary_exports_spans_with_logs_off_and_flushes_on_sigterm()
         .with_graceful_shutdown(bmc_shutdown.cancelled_owned())
         .await
     });
+    // Empty successful inventory responses let the real discovery loop exercise
+    // the shared gRPC client without requiring a full NICo API deployment.
+    let api_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let api_address = api_listener.local_addr()?;
+    let api_shutdown = cancel.clone();
+    let (api_tx, mut api_rx) = tokio::sync::mpsc::unbounded_channel();
+    let api = tokio::spawn(async move {
+        axum::serve(
+            api_listener,
+            axum::Router::new().fallback(move |request: axum::extract::Request| {
+                let api_tx = api_tx.clone();
+                async move {
+                    api_tx
+                        .send(
+                            request
+                                .headers()
+                                .get("traceparent")
+                                .and_then(|value| value.to_str().ok())
+                                .map(str::to_string),
+                        )
+                        .unwrap();
+                    http::Response::builder()
+                        .header("content-type", "application/grpc")
+                        .header("grpc-status", "0")
+                        .body(axum::body::Body::from(vec![0_u8; 5]))
+                        .unwrap()
+                }
+            }),
+        )
+        .with_graceful_shutdown(api_shutdown.cancelled_owned())
+        .await
+    });
     let metrics_listener = TcpListener::bind("127.0.0.1:0").await?;
     let metrics_address = metrics_listener.local_addr()?;
     drop(metrics_listener);
@@ -92,6 +124,14 @@ async fn binary_exports_spans_with_logs_off_and_flushes_on_sigterm()
         .arg(config_path)
         .current_dir(root)
         .env("RUST_LOG", "off")
+        .env(
+            "CARBIDE_HEALTH__ENDPOINT_SOURCES__NICO_API__ENABLED",
+            "true",
+        )
+        .env(
+            "CARBIDE_HEALTH__ENDPOINT_SOURCES__NICO_API__API_URL",
+            format!("http://{api_address}"),
+        )
         .env(
             "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
             format!("http://{otlp_address}"),
@@ -147,8 +187,40 @@ async fn binary_exports_spans_with_logs_off_and_flushes_on_sigterm()
         .flat_map(|scope| &scope.spans)
         .collect();
     assert!(spans.iter().any(|span| span.name == "health_collection"));
-    assert!(spans.iter().all(|span| span.parent_span_id.is_empty()
-        && span.end_time_unix_nano >= span.start_time_unix_nano));
+    assert!(spans.iter().any(|span| span.name == "health_discovery"));
+    let rpc = spans
+        .iter()
+        .find(|span| span.name == "grpc_client_request")
+        .expect("shared client spans are exported with RUST_LOG=off");
+    let discovery = spans
+        .iter()
+        .find(|span| span.name == "health_discovery" && span.trace_id == rpc.trace_id)
+        .unwrap();
+    assert_eq!(rpc.parent_span_id, discovery.span_id);
+    let expected = format!(
+        "00-{}-{}-01",
+        rpc.trace_id
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+        rpc.span_id
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    let mut parents = Vec::new();
+    while let Ok(parent) = api_rx.try_recv() {
+        parents.push(parent);
+    }
+    assert!(
+        parents.contains(&Some(expected)),
+        "the exported client context reaches the API"
+    );
+    assert!(
+        spans
+            .iter()
+            .all(|span| span.end_time_unix_nano >= span.start_time_unix_nano)
+    );
     assert!(
         spans.iter().all(|span| span.events.is_empty()),
         "hardware log payloads stay out of traces"
@@ -156,5 +228,6 @@ async fn binary_exports_spans_with_logs_off_and_flushes_on_sigterm()
     cancel.cancel();
     server.await??;
     bmc.await??;
+    api.await??;
     Ok(())
 }

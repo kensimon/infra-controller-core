@@ -67,7 +67,9 @@ configuration changes, including targets and profile selections, require restart
 Hardware-health can export OpenTelemetry traces for periodic collection, OTLP log/metric sends,
 and application-owned stream, gNMI, and TLS replacement connection attempts. These finite operations
 start independent traces and record outcomes and timing; stream lifetimes and automatic transport
-reconnects are excluded.
+reconnects are excluded. Discovery cycles group inventory API calls. Shared gRPC client spans propagate
+context into NICo API, and queued report submissions continue the trace of the latest report's
+producing operation without retaining an open collection span.
 
 Set `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` to an OTLP/gRPC collector endpoint before starting the
 service. `OTEL_EXPORTER_OTLP_ENDPOINT` is the fallback; with neither variable set, span export stays

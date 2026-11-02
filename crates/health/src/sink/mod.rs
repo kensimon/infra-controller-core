@@ -28,6 +28,7 @@ mod nvlink_domain_health_report;
 pub(crate) mod otlp;
 mod power_shelf_health_report;
 mod prometheus;
+mod queued_health_report;
 mod rack_health_report;
 mod report_worker;
 mod shutdown;

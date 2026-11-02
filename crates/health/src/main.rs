@@ -40,13 +40,13 @@ async fn main() -> Result<(), HealthError> {
     tracing_subscriber::registry()
         .with(log_events.layer().with_filter(env_filter.clone()))
         // Collector logs may contain hardware payloads. Export operation spans
-        // only, without attaching log events or dependency spans to them.
+        // and the shared RPC client spans, without attaching log events to them.
         .with(
             span_layer.with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
                 metadata.is_span()
-                    && metadata
-                        .module_path()
-                        .is_some_and(|path| path.starts_with("carbide_health::"))
+                    && metadata.module_path().is_some_and(|path| {
+                        path.starts_with("carbide_health::") || path == "rpc::grpc_client_tracing"
+                    })
             })),
         )
         .with(

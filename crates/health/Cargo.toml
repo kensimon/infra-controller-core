@@ -71,6 +71,7 @@ tempfile = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { features = [
   "env-filter",
   "local-time",
@@ -128,6 +129,7 @@ bench-hooks = []
 test-support = []
 
 [dev-dependencies]
+trace-propagation = { path = "../trace-propagation" }
 opentelemetry-proto = { workspace = true, features = ["gen-tonic", "trace"] }
 axum = { workspace = true, features = ["http2"] }
 bmc-mock = { path = "../bmc-mock" }
@@ -136,7 +138,6 @@ carbide-test-support = { path = "../test-support" }
 criterion = { workspace = true }
 figment = { workspace = true, features = ["test"] }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
-tracing-opentelemetry = { workspace = true }
 rcgen = { workspace = true }
 time = { workspace = true }
 
