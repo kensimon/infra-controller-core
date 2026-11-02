@@ -188,6 +188,16 @@ async fn binary_exports_spans_with_logs_off_and_flushes_on_sigterm()
         .collect();
     assert!(spans.iter().any(|span| span.name == "health_collection"));
     assert!(spans.iter().any(|span| span.name == "health_discovery"));
+    let bmc_span = spans
+        .iter()
+        .find(|span| span.name == "nv_redfish_http")
+        .expect("BMC HTTP spans export with logs off");
+    assert!(
+        spans
+            .iter()
+            .any(|parent| parent.span_id == bmc_span.parent_span_id
+                && parent.trace_id == bmc_span.trace_id)
+    );
     let rpc = spans
         .iter()
         .find(|span| span.name == "grpc_client_request")

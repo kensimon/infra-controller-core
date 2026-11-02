@@ -69,7 +69,9 @@ and application-owned stream, gNMI, and TLS replacement connection attempts. The
 start independent traces and record outcomes and timing; stream lifetimes and automatic transport
 reconnects are excluded. Discovery cycles group inventory API calls. Shared gRPC client spans propagate
 context into NICo API, and queued report submissions continue the trace of the latest report's
-producing operation without retaining an open collection span.
+producing operation without retaining an open collection span. BMC HTTP client spans show method,
+resource path, outcome, and preserved response status, while keeping pooled connections and SSE
+stream lifetimes separate from the request spans.
 
 Set `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` to an OTLP/gRPC collector endpoint before starting the
 service. `OTEL_EXPORTER_OTLP_ENDPOINT` is the fallback; with neither variable set, span export stays

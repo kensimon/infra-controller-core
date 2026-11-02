@@ -328,6 +328,7 @@ can generate substantial trace volume across many targets; choose a ratio approp
 
 | Span | Boundary and fields |
 | --- | --- |
+| `nv_redfish_http` | One BMC HTTP client operation below nv-redfish's cache, parented to its collection or connection span. Includes HTTP method, target host/port, logical BMC IP, resource path, outcome, and preserved response status when available. |
 | `health_discovery` | One discovery/reconciliation iteration, including NICo inventory API calls. Includes discovered and sharded endpoint counts and active sensor monitor count. |
 | `health_report_submit` | One queued health-report submission, parented to the operation that produced the latest queued report. Includes report target, target ID, and source. |
 | `grpc_client_request` | Shared NICo API client transport spans, including connection probes. Includes RPC service/method, HTTP response status, and gRPC status from headers or trailers. Context is propagated to NICo API server spans. |
@@ -343,6 +344,18 @@ operation spans record `outcome` as `success`, `partial_success`, `error`, or `c
 Retries are separate traces, identified by their target, signal, and attempt number. Connection spans
 close before consuming a long-lived stream. Tonic's automatic transport reconnects and stream
 lifetimes are outside this coverage. These spans do not inject trace context into hardware requests.
+
+The BMC HTTP spans use the client boundary also wrapped by Core's
+`SpanIsolatedHttpClient` (`crates/redfish/src/nv_redfish/span_isolated_http_client.rs`).
+Health's wrapper adds request metadata and detaches the underlying transport from the tracing
+dispatch so pooled connections cannot keep request or collection spans open. SSE spans end after
+connection establishment, before consuming the event stream. Cache hits do not issue HTTP spans;
+a client operation can include nv-redfish's internal retries. Successful ordinary responses lose
+their original HTTP status in nv-redfish, so those spans omit the status rather than assuming 200.
+HTTP error statuses and preserved task/no-content statuses are recorded when available. A 304 cache
+validation records success, even though nv-redfish represents it internally as an error. Request
+paths exclude query strings and fragments; URL credentials, headers, and bodies are not recorded.
+BMC requests do not inject trace headers.
 
 Health-report queues carry only the producing span's trace identity, flags, and trace state, so
 queueing does not retain an open collection span. A newer report replaces both the queued payload

@@ -16,6 +16,7 @@
  */
 
 use std::any::{Any, type_name};
+use std::future::Future;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -44,6 +45,7 @@ use nv_redfish::core::{
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, OnceCell, RwLock, Semaphore};
+use tracing::instrument::WithSubscriber;
 use url::Url;
 
 use crate::HealthError;
@@ -1184,6 +1186,55 @@ impl InstrumentedHttpClient {
         }
     }
 
+    /// Trace one nv-redfish operation below its cache. Pooled transport tasks
+    /// must not capture this request span or the enclosing collection span.
+    async fn trace_request<T>(
+        &self,
+        method: &'static str,
+        url: &Url,
+        future: impl Future<Output = Result<T, BmcError>>,
+        status_code: impl FnOnce(&Result<T, BmcError>) -> Option<u16>,
+    ) -> (Result<T, BmcError>, Duration) {
+        let span = tracing::info_span!(
+            "nv_redfish_http",
+            otel.kind = "client",
+            http.request.method = method,
+            server.address = url.host_str(),
+            server.port = url.port_or_known_default(),
+            bmc_ip_address = %self.server_address,
+            url.path = url.path(),
+            http.response.status_code = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
+            logfmt.suppress = true,
+        );
+        crate::operation_tracing::operation(
+            span,
+            async {
+                // Like Core's SpanIsolatedHttpClient, isolate transport work
+                // from application spans. A no-op dispatch avoids exporting a
+                // detached connection-lifetime span, even with RUST_LOG=off.
+                let started = Instant::now();
+                let result = future.with_subscriber(tracing::Dispatch::none()).await;
+                (result, started.elapsed())
+            },
+            |(result, _)| {
+                let status_code = status_code(result);
+                if let Some(status_code) = status_code {
+                    tracing::Span::current().record("http.response.status_code", status_code);
+                }
+                // nv-redfish represents a successful cache validation as an
+                // InvalidResponse so HttpBmc can substitute its cached entity.
+                if status_code == Some(http::StatusCode::NOT_MODIFIED.as_u16()) {
+                    crate::operation_tracing::Outcome::Success
+                } else {
+                    crate::operation_tracing::Outcome::from(result)
+                }
+            },
+        )
+        .await
+    }
+
     fn observe(
         &self,
         method: &str,
@@ -1351,12 +1402,15 @@ impl HttpClient for InstrumentedHttpClient {
     {
         let request_url = url.clone();
         // Measure only the transport future and stop as soon as it resolves.
-        let started = Instant::now();
-        let result = self
-            .inner
-            .get::<T>(url, credentials, etag, custom_headers, repair)
+        let (result, external_duration) = self
+            .trace_request(
+                "GET",
+                &request_url,
+                self.inner
+                    .get::<T>(url, credentials, etag, custom_headers, repair),
+                known_response_status,
+            )
             .await;
-        let external_duration = started.elapsed();
 
         // Sanitize and classify locally without charging that work to BMC latency.
         let result = redact_request_credential(result, credentials);
@@ -1376,9 +1430,14 @@ impl HttpClient for InstrumentedHttpClient {
         let request_url = url.clone();
 
         // Exclude local redaction and metric recording from BMC latency.
-        let started = Instant::now();
-        let result = self.inner.poll(url, credentials, custom_headers).await;
-        let external_duration = started.elapsed();
+        let (result, external_duration) = self
+            .trace_request(
+                "GET",
+                &request_url,
+                self.inner.poll(url, credentials, custom_headers),
+                known_modification_status,
+            )
+            .await;
 
         let result = redact_request_credential(result, credentials);
 
@@ -1413,12 +1472,15 @@ impl HttpClient for InstrumentedHttpClient {
         let request_url = url.clone();
         let entity_status_code = post_entity_status_code(&request_url);
         // Measure only the transport future and stop as soon as it resolves.
-        let started = Instant::now();
-        let result = self
-            .inner
-            .post::<B, T>(url, body, credentials, custom_headers)
+        let (result, external_duration) = self
+            .trace_request(
+                "POST",
+                &request_url,
+                self.inner
+                    .post::<B, T>(url, body, credentials, custom_headers),
+                known_modification_status,
+            )
             .await;
-        let external_duration = started.elapsed();
 
         // Sanitize and classify locally without charging that work to BMC latency.
         let result = redact_request_credential(result, credentials);
@@ -1444,12 +1506,14 @@ impl HttpClient for InstrumentedHttpClient {
     {
         let request_url = url.clone();
         // Measure only the transport future and stop as soon as it resolves.
-        let started = Instant::now();
-        let result = self
-            .inner
-            .post_session::<B, T>(url, body, custom_headers)
+        let (result, external_duration) = self
+            .trace_request(
+                "POST",
+                &request_url,
+                self.inner.post_session::<B, T>(url, body, custom_headers),
+                known_response_status,
+            )
             .await;
-        let external_duration = started.elapsed();
 
         // Sanitize and classify locally without charging that work to BMC latency.
         let result = redact_session_request_values(result, body);
@@ -1471,12 +1535,19 @@ impl HttpClient for InstrumentedHttpClient {
     {
         let request_url = url.clone();
         // Measure only the transport future and stop as soon as it resolves.
-        let started = Instant::now();
-        let result = self
-            .inner
-            .post_multipart_update::<U, V, T>(url, request, credentials, custom_headers)
+        let (result, external_duration) = self
+            .trace_request(
+                "POST",
+                &request_url,
+                self.inner.post_multipart_update::<U, V, T>(
+                    url,
+                    request,
+                    credentials,
+                    custom_headers,
+                ),
+                known_modification_status,
+            )
             .await;
-        let external_duration = started.elapsed();
 
         // Sanitize and classify locally without charging that work to BMC latency.
         let result = redact_request_credential(result, credentials);
@@ -1497,12 +1568,19 @@ impl HttpClient for InstrumentedHttpClient {
     {
         let request_url = url.clone();
         // Measure only the transport future and stop as soon as it resolves.
-        let started = Instant::now();
-        let result = self
-            .inner
-            .post_http_push_uri_update::<U, T>(url, request, credentials, custom_headers)
+        let (result, external_duration) = self
+            .trace_request(
+                "POST",
+                &request_url,
+                self.inner.post_http_push_uri_update::<U, T>(
+                    url,
+                    request,
+                    credentials,
+                    custom_headers,
+                ),
+                known_modification_status,
+            )
             .await;
-        let external_duration = started.elapsed();
 
         // Sanitize and classify locally without charging that work to BMC latency.
         let result = redact_request_credential(result, credentials);
@@ -1524,12 +1602,15 @@ impl HttpClient for InstrumentedHttpClient {
     {
         let request_url = url.clone();
         // Measure only the transport future and stop as soon as it resolves.
-        let started = Instant::now();
-        let result = self
-            .inner
-            .patch::<B, T>(url, etag, body, credentials, custom_headers)
+        let (result, external_duration) = self
+            .trace_request(
+                "PATCH",
+                &request_url,
+                self.inner
+                    .patch::<B, T>(url, etag, body, credentials, custom_headers),
+                known_modification_status,
+            )
             .await;
-        let external_duration = started.elapsed();
 
         // Sanitize and classify locally without charging that work to BMC latency.
         let result = redact_request_credential(result, credentials);
@@ -1548,12 +1629,14 @@ impl HttpClient for InstrumentedHttpClient {
     {
         let request_url = url.clone();
         // Measure only the transport future and stop as soon as it resolves.
-        let started = Instant::now();
-        let result = self
-            .inner
-            .delete::<T>(url, credentials, custom_headers)
+        let (result, external_duration) = self
+            .trace_request(
+                "DELETE",
+                &request_url,
+                self.inner.delete::<T>(url, credentials, custom_headers),
+                known_modification_status,
+            )
             .await;
-        let external_duration = started.elapsed();
 
         // Sanitize and classify locally without charging that work to BMC latency.
         let result = redact_request_credential(result, credentials);
@@ -1569,9 +1652,14 @@ impl HttpClient for InstrumentedHttpClient {
     ) -> Result<BoxTryStream<T, Self::Error>, Self::Error> {
         let request_url = url.clone();
         // Measure only the transport future and stop as soon as it resolves.
-        let started = Instant::now();
-        let result = self.inner.sse::<T>(url, credentials, custom_headers).await;
-        let external_duration = started.elapsed();
+        let (result, external_duration) = self
+            .trace_request(
+                "GET",
+                &request_url,
+                self.inner.sse::<T>(url, credentials, custom_headers),
+                known_response_status,
+            )
+            .await;
 
         // Sanitize and classify locally without charging that work to BMC latency.
         let result = redact_request_credential(result, credentials);
@@ -1589,20 +1677,38 @@ impl HttpClient for InstrumentedHttpClient {
         let request_url = url.clone();
 
         // Exclude local redaction and metric recording from BMC latency.
-        let started = Instant::now();
-
-        let result = self
-            .inner
-            .sse_events::<T>(url, credentials, custom_headers, last_event_id)
+        let (result, external_duration) = self
+            .trace_request(
+                "GET",
+                &request_url,
+                self.inner
+                    .sse_events::<T>(url, credentials, custom_headers, last_event_id),
+                known_response_status,
+            )
             .await;
-
-        let external_duration = started.elapsed();
 
         let result = redact_request_credential(result, credentials);
 
         self.observe_result("GET", &request_url, &result, "200", external_duration);
 
         result
+    }
+}
+
+// nv-redfish does not retain the HTTP status for ordinary successful entities.
+// Record only preserved statuses rather than inventing a successful 200/201.
+fn known_response_status<T>(result: &Result<T, BmcError>) -> Option<u16> {
+    match result {
+        Err(BmcError::InvalidResponse { status, .. }) => Some(status.as_u16()),
+        _ => None,
+    }
+}
+
+fn known_modification_status<T>(result: &Result<ModificationResponse<T>, BmcError>) -> Option<u16> {
+    match result {
+        Ok(ModificationResponse::Task(_)) => Some(202),
+        Ok(ModificationResponse::Empty) => Some(204),
+        _ => known_response_status(result),
     }
 }
 
@@ -3565,6 +3671,157 @@ mod tests {
         )
         .expect("constructor ok");
         (client, provider_calls)
+    }
+
+    #[tokio::test]
+    async fn request_spans_finish_before_pooled_connections_and_streams_close() {
+        use futures::StreamExt;
+        use tracing::Instrument;
+
+        use crate::operation_tracing::tests::{SpanCapture, attribute};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            use axum::response::IntoResponse;
+            axum::serve(
+                listener,
+                axum::Router::new().fallback(|request: axum::extract::Request| async move {
+                    assert!(
+                        !request.headers().contains_key("traceparent"),
+                        "BMC calls do not propagate trace context"
+                    );
+                    match request.uri().path() {
+                        "/redfish/v1/events" => {
+                            let events = futures::stream::once(async {
+                                Ok::<_, std::convert::Infallible>(
+                                    axum::response::sse::Event::default().data("{}"),
+                                )
+                            })
+                            .chain(futures::stream::pending());
+                            axum::response::Sse::new(events).into_response()
+                        }
+                        "/redfish/v1/cached" => http::StatusCode::NOT_MODIFIED.into_response(),
+                        "/redfish/v1/bad" => (
+                            http::StatusCode::SERVICE_UNAVAILABLE,
+                            "response-payload-secret",
+                        )
+                            .into_response(),
+                        _ => axum::Json(serde_json::json!({"value":"response-payload-secret"}))
+                            .into_response(),
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        });
+        let client = InstrumentedHttpClient::new(
+            reqwest(),
+            None,
+            "192.0.2.1".into(),
+            "http".into(),
+            Arc::new(StdMutex::new(BmcIdentity::default())),
+        );
+        let credentials = NvBmcCredentials::Token {
+            token: "header-secret".into(),
+        };
+        for (path, outcome, expected_status) in [
+            ("good", "success", None),
+            ("bad", "error", Some("503")),
+            ("cached", "success", Some("304")),
+        ] {
+            let capture = SpanCapture::new();
+            async {
+                let parent = tracing::info_span!(parent: None, "test_bmc_collection");
+                client.get::<serde_json::Value>(
+                    format!("http://url-user:url-password@{address}/redfish/v1/{path}?token=query-secret#fragment-secret").parse().unwrap(),
+                    &credentials, None, &HeaderMap::new(), &nv_redfish::core::NoRepair,
+                ).instrument(parent).await
+            }.with_subscriber(capture.dispatch.clone()).await.ok();
+            let spans = capture.spans();
+            let request = spans
+                .iter()
+                .find(|s| s.name == "nv_redfish_http")
+                .expect("request span closes while the client and pooled connection remain alive");
+            let parent = spans
+                .iter()
+                .find(|s| s.name == "test_bmc_collection")
+                .expect("connection does not retain the parent span");
+            assert_eq!(request.parent_span_id, parent.span_context.span_id());
+            assert_eq!(
+                request.span_context.trace_id(),
+                parent.span_context.trace_id()
+            );
+            assert_eq!(request.span_kind, opentelemetry::trace::SpanKind::Client);
+            assert_eq!(
+                attribute(request, "http.request.method").as_deref(),
+                Some("GET")
+            );
+            assert_eq!(
+                attribute(request, "url.path"),
+                Some(format!("/redfish/v1/{path}"))
+            );
+            assert_eq!(
+                attribute(request, "http.response.status_code").as_deref(),
+                expected_status
+            );
+            assert_eq!(attribute(request, "outcome").as_deref(), Some(outcome));
+            assert_eq!(
+                request.status,
+                if outcome == "success" {
+                    opentelemetry::trace::Status::Ok
+                } else {
+                    opentelemetry::trace::Status::error("")
+                }
+            );
+            for span in &spans {
+                let attributes = format!("{:?}", span.attributes);
+                for secret in [
+                    "url-user",
+                    "url-password",
+                    "query-secret",
+                    "fragment-secret",
+                    "header-secret",
+                    "response-payload-secret",
+                ] {
+                    assert!(
+                        !attributes.contains(secret),
+                        "span must not expose {secret}"
+                    );
+                }
+                assert!(span.events.is_empty());
+            }
+        }
+        let capture = SpanCapture::new();
+        let stream = async {
+            let parent = tracing::info_span!(parent: None, "test_stream_connect");
+            client
+                .sse_events::<serde_json::Value>(
+                    format!("http://{address}/redfish/v1/events")
+                        .parse()
+                        .unwrap(),
+                    &credentials,
+                    &HeaderMap::new(),
+                    None,
+                )
+                .instrument(parent)
+                .await
+                .unwrap()
+        }
+        .with_subscriber(capture.dispatch.clone())
+        .await;
+        let spans = capture.spans();
+        assert!(
+            spans.iter().any(|s| s.name == "nv_redfish_http"),
+            "HTTP span closes before the event stream"
+        );
+        assert!(
+            spans.iter().any(|s| s.name == "test_stream_connect"),
+            "stream does not retain its connecting parent"
+        );
+        drop(stream);
+        drop(client);
+        server.abort();
     }
 
     fn bmc_latency_metrics(prefix: &str) -> (Registry, Arc<BmcLatencyMetrics>) {
