@@ -28,7 +28,7 @@ name = "forge-hw-health"
 path = "src/main.rs"
 
 [dependencies]
-carbide-instrument = { path = "../instrument" }
+carbide-instrument = { path = "../instrument", features = ["otlp-tracing"] }
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
@@ -128,12 +128,15 @@ bench-hooks = []
 test-support = []
 
 [dev-dependencies]
+opentelemetry-proto = { workspace = true, features = ["gen-tonic", "trace"] }
 axum = { workspace = true, features = ["http2"] }
 bmc-mock = { path = "../bmc-mock" }
 carbide-instrument = { path = "../instrument", features = ["test-support"] }
 carbide-test-support = { path = "../test-support" }
 criterion = { workspace = true }
 figment = { workspace = true, features = ["test"] }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+tracing-opentelemetry = { workspace = true }
 rcgen = { workspace = true }
 time = { workspace = true }
 

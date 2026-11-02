@@ -62,6 +62,24 @@ Profile/override changes need no restart. Removed overrides restore profile valu
 removing a selected profile or the last username causes lookup errors. Main
 configuration changes, including targets and profile selections, require restart.
 
+## Operation tracing
+
+Hardware-health can export OpenTelemetry traces for periodic collection, OTLP log/metric sends,
+and application-owned stream, gNMI, and TLS replacement connection attempts. These finite operations
+start independent traces and record outcomes and timing; stream lifetimes and automatic transport
+reconnects are excluded.
+
+Set `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` to an OTLP/gRPC collector endpoint before starting the
+service. `OTEL_EXPORTER_OTLP_ENDPOINT` is the fallback; with neither variable set, span export stays
+off. `NICO_TRACES_SPAN_LEVEL` defaults to `info` and filters spans independently of `RUST_LOG`.
+Standard `OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG` settings control sampling. Tracing settings
+require a restart. There are no additional TOML settings.
+
+Span export is separate from `[sinks.otlp]` (hardware telemetry export) and `[sinks.tracing]`
+(collected events written to service logs). The exporter flushes pending spans on service termination.
+See [hardware-health tracing](../../docs/observability/tracing.md#nico-hardware-health-tracing)
+for operation fields, sampling, failure behavior, and transport limits.
+
 ## Prerequisites
 
 - Run every command from the repository root.

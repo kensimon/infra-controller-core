@@ -45,6 +45,7 @@ mod static_credentials;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
+mod operation_tracing;
 mod tls;
 
 pub use config::Config;

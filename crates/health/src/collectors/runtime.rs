@@ -30,6 +30,7 @@ use prometheus::{Counter, Gauge, Histogram, HistogramOpts, IntCounter, IntGauge,
 use rand::RngExt;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tracing::instrument::WithSubscriber;
 
 use crate::HealthError;
 use crate::bmc::BmcClient;
@@ -494,7 +495,34 @@ impl Collector {
                         limiter.acquire().await;
 
                         let start = Instant::now();
-                        let iteration_result = runner.run_iteration().await;
+                        let span = tracing::info_span!(
+                            parent: None,
+                            "health_collection",
+                            collector_type,
+                            endpoint_address = ?endpoint.addr,
+                            outcome = tracing::field::Empty,
+                            otel.status_code = tracing::field::Empty,
+                            refresh_triggered = tracing::field::Empty,
+                            entity_count = tracing::field::Empty,
+                            fetch_failure_count = tracing::field::Empty,
+                            logfmt.suppress = true,
+                        );
+                        let iteration_result = crate::operation_tracing::operation(
+                            span,
+                            runner.run_iteration(),
+                            |result| {
+                                if let Ok(result) = result {
+                                    let span = tracing::Span::current();
+                                    span.record("refresh_triggered", result.refresh_triggered);
+                                    span.record("entity_count", result.entity_count);
+                                    span.record("fetch_failure_count", result.fetch_failures);
+                                    if result.fetch_failures > 0 {
+                                        return crate::operation_tracing::Outcome::PartialSuccess;
+                                    }
+                                }
+                                crate::operation_tracing::Outcome::from(result)
+                            },
+                        ).await;
                         let duration = start.elapsed();
 
                         iteration_histogram.observe(duration.as_secs_f64());
@@ -537,7 +565,7 @@ impl Collector {
                     }
                 }
             }
-        });
+        }.with_current_subscriber());
 
         Ok(Self {
             handle,
@@ -599,15 +627,31 @@ impl Collector {
                 }
 
                 let closed = {
+                    let span = tracing::info_span!(
+                        parent: None,
+                        "health_stream_connect",
+                        collector_type,
+                        endpoint_address = ?endpoint.addr,
+                        outcome = tracing::field::Empty,
+                        otel.status_code = tracing::field::Empty,
+                        logfmt.suppress = true,
+                    );
                     let mut connect = collector.connect();
+                    let result = crate::operation_tracing::operation(span, cancel_clone.run_until_cancelled(&mut connect), |result| {
+                        match result {
+                            Some(Ok(StreamingConnectResult::Connected(_))) => crate::operation_tracing::Outcome::Success,
+                            _ => crate::operation_tracing::Outcome::Error,
+                        }
+                    }).await;
 
-                    let Some(connected) = cancel_clone.run_until_cancelled(&mut connect).await
+                    let Some(connected) = result
                     else {
                         // The open may already have created a destination on the BMC.
                         let opened = matches!(
                             tokio::time::timeout(CANCELLED_CONNECT_GRACE, connect).await,
                             Ok(Ok(StreamingConnectResult::Connected(_)))
                         );
+                        std::mem::drop(result);
 
                         if opened {
                             collector.disconnect(CloseReason::Cancelled).await;
@@ -760,7 +804,7 @@ impl Collector {
                     return;
                 }
             }
-        });
+        }.with_current_subscriber());
 
         Ok(Self {
             handle,
@@ -993,127 +1037,160 @@ mod tests {
     #[tokio::test]
     async fn streaming_collector_emits_pre_connected_failure_events_without_connected_callback()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let endpoint = Arc::new(test_endpoint(mac("00:11:22:33:44:66")));
-        let bmc = Arc::clone(endpoint.bmc());
-        let metrics_manager = MetricsManager::new("test_streaming_runtime_preconnect_failure")?;
+        let capture = crate::operation_tracing::tests::SpanCapture::new();
+        async {
+            let endpoint = Arc::new(test_endpoint(mac("00:11:22:33:44:66")));
+            let bmc = Arc::clone(endpoint.bmc());
+            let metrics_manager = MetricsManager::new("test_streaming_runtime_preconnect_failure")?;
 
-        let collector_registry = Arc::new(metrics_manager.create_collector_registry(
-            "streaming_collector_preconnect_failure_test".to_string(),
-            "test_streaming_runtime_preconnect_failure",
-        )?);
+            let collector_registry = Arc::new(metrics_manager.create_collector_registry(
+                "streaming_collector_preconnect_failure_test".to_string(),
+                "test_streaming_runtime_preconnect_failure",
+            )?);
 
-        let sink = Arc::new(CountingSink::default());
-        let data_sink: Arc<dyn DataSink> = sink.clone();
-        let (callback_tx, callback_rx) = tokio::sync::oneshot::channel();
-        let mut callback_tx = Some(callback_tx);
+            let sink = Arc::new(CountingSink::default());
+            let data_sink: Arc<dyn DataSink> = sink.clone();
+            let (callback_tx, callback_rx) = tokio::sync::oneshot::channel();
+            let mut callback_tx = Some(callback_tx);
 
-        let collector = Collector::start_streaming::<TestStreamingCollector, _>(
-            endpoint,
-            bmc,
-            (),
-            data_sink,
-            StreamingCollectorStartContext {
-                backoff_config: BackoffConfig::default(),
-                collector_registry,
-            },
-            move |result| {
-                if let Some(tx) = callback_tx.take() {
-                    let _ = tx.send(result.is_ok());
-                }
+            let collector = Collector::start_streaming::<TestStreamingCollector, _>(
+                endpoint,
+                bmc,
+                (),
+                data_sink,
+                StreamingCollectorStartContext {
+                    backoff_config: BackoffConfig::default(),
+                    collector_registry,
+                },
+                move |result| {
+                    if let Some(tx) = callback_tx.take() {
+                        let _ = tx.send(result.is_ok());
+                    }
 
-                false
-            },
-        )?;
+                    false
+                },
+            )?;
 
-        let connected_callback =
-            tokio::time::timeout(Duration::from_secs(1), callback_rx).await??;
+            let connected_callback =
+                tokio::time::timeout(Duration::from_secs(1), callback_rx).await??;
 
-        collector.stop().await;
+            collector.stop().await;
 
-        assert!(!connected_callback);
-        assert_eq!(sink.log_count(), 1);
+            assert!(!connected_callback);
+            assert_eq!(sink.log_count(), 1);
+            let spans = capture.spans();
+            assert_eq!(spans.len(), 1);
+            assert_eq!(spans[0].name, "health_stream_connect");
+            assert_eq!(
+                crate::operation_tracing::tests::attribute(&spans[0], "outcome").as_deref(),
+                Some("error")
+            );
 
-        Ok(())
+            Ok(())
+        }
+        .with_subscriber(capture.dispatch.clone())
+        .await
     }
 
     #[tokio::test]
     async fn streaming_collector_disconnects_after_every_stream_and_reports_all_but_cancellation()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let endpoint = Arc::new(test_endpoint(mac("00:11:22:33:44:77")));
-        let bmc = Arc::clone(endpoint.bmc());
-        let metrics_manager = MetricsManager::new("test_streaming_runtime_stream_lifetime")?;
+        let capture = crate::operation_tracing::tests::SpanCapture::new();
+        async {
+            let endpoint = Arc::new(test_endpoint(mac("00:11:22:33:44:77")));
+            let bmc = Arc::clone(endpoint.bmc());
+            let metrics_manager = MetricsManager::new("test_streaming_runtime_stream_lifetime")?;
 
-        let collector_registry = Arc::new(metrics_manager.create_collector_registry(
-            "streaming_collector_stream_lifetime_test".to_string(),
-            "test_streaming_runtime_stream_lifetime",
-        )?);
+            let collector_registry = Arc::new(metrics_manager.create_collector_registry(
+                "streaming_collector_stream_lifetime_test".to_string(),
+                "test_streaming_runtime_stream_lifetime",
+            )?);
 
-        let data_sink: Arc<dyn DataSink> = Arc::new(CountingSink::default());
-        let (callback_tx, mut callback_rx) = tokio::sync::mpsc::unbounded_channel();
-        let steps = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let data_sink: Arc<dyn DataSink> = Arc::new(CountingSink::default());
+            let (callback_tx, mut callback_rx) = tokio::sync::mpsc::unbounded_channel();
+            let steps = Arc::new(std::sync::Mutex::new(Vec::new()));
 
-        let collector = Collector::start_streaming::<SessionStreamingCollector, _>(
-            endpoint,
-            bmc,
-            (
-                vec![
-                    StreamBehavior::End,
-                    StreamBehavior::Error,
-                    StreamBehavior::EventThenEnd,
-                    StreamBehavior::Pending,
-                ],
-                Arc::clone(&steps),
-            ),
-            data_sink,
-            StreamingCollectorStartContext {
-                backoff_config: BackoffConfig {
-                    initial: Duration::ZERO,
-                    max: Duration::ZERO,
+            let collector = Collector::start_streaming::<SessionStreamingCollector, _>(
+                endpoint,
+                bmc,
+                (
+                    vec![
+                        StreamBehavior::End,
+                        StreamBehavior::Error,
+                        StreamBehavior::EventThenEnd,
+                        StreamBehavior::Pending,
+                    ],
+                    Arc::clone(&steps),
+                ),
+                data_sink,
+                StreamingCollectorStartContext {
+                    backoff_config: BackoffConfig {
+                        initial: Duration::ZERO,
+                        max: Duration::ZERO,
+                    },
+                    collector_registry,
                 },
-                collector_registry,
-            },
-            move |result| callback_tx.send(result.is_ok()).is_ok(),
-        )?;
+                move |result| callback_tx.send(result.is_ok()).is_ok(),
+            )?;
 
-        let callbacks = tokio::time::timeout(Duration::from_secs(1), async {
-            let callbacks = [
-                callback_rx.recv().await,
-                callback_rx.recv().await,
-                callback_rx.recv().await,
-            ];
+            let callbacks = tokio::time::timeout(Duration::from_secs(1), async {
+                let callbacks = [
+                    callback_rx.recv().await,
+                    callback_rx.recv().await,
+                    callback_rx.recv().await,
+                ];
 
-            // Cancel only once the pending stream is open.
-            while steps.lock().unwrap().len() < 7 {
-                tokio::task::yield_now().await;
-            }
+                // Cancel only once the pending stream is open.
+                while steps.lock().unwrap().len() < 7 {
+                    tokio::task::yield_now().await;
+                }
 
-            callbacks
-        })
-        .await?;
+                callbacks
+            })
+            .await?;
 
-        collector.stop().await;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while capture.spans().len() < 4 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+            let spans = capture.spans();
+            assert_eq!(
+                spans.len(),
+                4,
+                "connection spans finish while streams are still open"
+            );
+            assert!(spans.iter().all(|span| {
+                crate::operation_tracing::tests::attribute(span, "outcome").as_deref()
+                    == Some("success")
+            }));
+            collector.stop().await;
 
-        assert_eq!(callbacks, [Some(true), Some(true), Some(true)]);
-        assert!(callback_rx.try_recv().is_err());
+            assert_eq!(callbacks, [Some(true), Some(true), Some(true)]);
+            assert!(callback_rx.try_recv().is_err());
 
-        let ended = SessionStep::Ended { received: false };
+            let ended = SessionStep::Ended { received: false };
 
-        assert_eq!(
-            *steps.lock().unwrap(),
-            [
-                SessionStep::Opened,
-                ended,
-                SessionStep::Opened,
-                ended,
-                SessionStep::Opened,
-                SessionStep::Ended { received: true },
-                SessionStep::Opened,
-                SessionStep::Cancelled,
-            ],
-            "each stream must disconnect once after it closes"
-        );
+            assert_eq!(
+                *steps.lock().unwrap(),
+                [
+                    SessionStep::Opened,
+                    ended,
+                    SessionStep::Opened,
+                    ended,
+                    SessionStep::Opened,
+                    SessionStep::Ended { received: true },
+                    SessionStep::Opened,
+                    SessionStep::Cancelled,
+                ],
+                "each stream must disconnect once after it closes"
+            );
 
-        Ok(())
+            Ok(())
+        }
+        .with_subscriber(capture.dispatch.clone())
+        .await
     }
 
     #[tokio::test(start_paused = true)]
@@ -1334,65 +1411,70 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn streaming_backoff_grows_until_a_stream_yields_data()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let endpoint = Arc::new(test_endpoint(mac("00:11:22:33:44:88")));
-        let bmc = Arc::clone(endpoint.bmc());
-        let metrics_manager = MetricsManager::new("test_streaming_runtime_backoff")?;
+        let capture = crate::operation_tracing::tests::SpanCapture::new();
+        async {
+            let endpoint = Arc::new(test_endpoint(mac("00:11:22:33:44:88")));
+            let bmc = Arc::clone(endpoint.bmc());
+            let metrics_manager = MetricsManager::new("test_streaming_runtime_backoff")?;
 
-        let collector_registry = Arc::new(metrics_manager.create_collector_registry(
-            "streaming_collector_backoff_test".to_string(),
-            "test_streaming_runtime_backoff",
-        )?);
+            let collector_registry = Arc::new(metrics_manager.create_collector_registry(
+                "streaming_collector_backoff_test".to_string(),
+                "test_streaming_runtime_backoff",
+            )?);
 
-        let data_sink: Arc<dyn DataSink> = Arc::new(CountingSink::default());
-        let (ended_tx, mut ended_rx) = tokio::sync::mpsc::unbounded_channel();
+            let data_sink: Arc<dyn DataSink> = Arc::new(CountingSink::default());
+            let (ended_tx, mut ended_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let collector = Collector::start_streaming::<SessionStreamingCollector, _>(
-            endpoint,
-            bmc,
-            (
-                vec![
-                    StreamBehavior::End,
-                    StreamBehavior::End,
-                    StreamBehavior::EventThenEnd,
-                    StreamBehavior::End,
-                ],
-                Arc::default(),
-            ),
-            data_sink,
-            StreamingCollectorStartContext {
-                backoff_config: BackoffConfig {
-                    initial: Duration::from_secs(1),
-                    max: Duration::from_secs(60),
+            let collector = Collector::start_streaming::<SessionStreamingCollector, _>(
+                endpoint,
+                bmc,
+                (
+                    vec![
+                        StreamBehavior::End,
+                        StreamBehavior::End,
+                        StreamBehavior::EventThenEnd,
+                        StreamBehavior::End,
+                    ],
+                    Arc::default(),
+                ),
+                data_sink,
+                StreamingCollectorStartContext {
+                    backoff_config: BackoffConfig {
+                        initial: Duration::from_secs(1),
+                        max: Duration::from_secs(60),
+                    },
+                    collector_registry,
                 },
-                collector_registry,
-            },
-            move |_| ended_tx.send(tokio::time::Instant::now()).is_ok(),
-        )?;
+                move |_| ended_tx.send(tokio::time::Instant::now()).is_ok(),
+            )?;
 
-        let mut ended = Vec::new();
+            let mut ended = Vec::new();
 
-        for _ in 0..4 {
-            ended.push(ended_rx.recv().await.ok_or("the collector stopped early")?);
+            for _ in 0..4 {
+                ended.push(ended_rx.recv().await.ok_or("the collector stopped early")?);
+            }
+
+            collector.stop().await;
+
+            let delays: Vec<Duration> = ended.windows(2).map(|pair| pair[1] - pair[0]).collect();
+
+            // Each delay is its base plus jitter below the base: [1s, 2s), [2s, 4s), then [1s, 2s).
+            assert!(delays[0] < Duration::from_secs(2), "{delays:?}");
+
+            assert!(
+                delays[1] >= Duration::from_secs(2),
+                "an empty stream must not reset the backoff: {delays:?}"
+            );
+
+            assert!(
+                delays[2] < Duration::from_secs(2),
+                "a stream that yields data must reset the backoff: {delays:?}"
+            );
+
+            Ok(())
         }
-
-        collector.stop().await;
-
-        let delays: Vec<Duration> = ended.windows(2).map(|pair| pair[1] - pair[0]).collect();
-
-        // Each delay is its base plus jitter below the base: [1s, 2s), [2s, 4s), then [1s, 2s).
-        assert!(delays[0] < Duration::from_secs(2), "{delays:?}");
-
-        assert!(
-            delays[1] >= Duration::from_secs(2),
-            "an empty stream must not reset the backoff: {delays:?}"
-        );
-
-        assert!(
-            delays[2] < Duration::from_secs(2),
-            "a stream that yields data must reset the backoff: {delays:?}"
-        );
-
-        Ok(())
+        .with_subscriber(capture.dispatch.clone())
+        .await
     }
 
     /// Records the time of every iteration.
@@ -1428,69 +1510,92 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn collectors_started_together_spread_after_their_first_iteration()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let interval = Duration::from_secs(60);
-        let metrics_manager = Arc::new(MetricsManager::new("test_periodic_phase")?);
-        let started = tokio::time::Instant::now();
-        let mut collectors = Vec::new();
-        let mut runs = Vec::new();
-        for index in 0..20_u8 {
-            let endpoint = Arc::new(test_endpoint(mac(&format!("00:11:22:33:44:{index:02x}"))));
-            let times = Arc::new(std::sync::Mutex::new(Vec::new()));
-            collectors.push(Collector::start::<TimedCollector>(
-                endpoint.clone(),
-                Arc::clone(endpoint.bmc()),
-                times.clone(),
-                CollectorStartContext {
-                    limiter: Arc::new(crate::limiter::NoopLimiter),
-                    iteration_interval: interval,
-                    collector_registry: Arc::new(metrics_manager.create_collector_registry(
-                        format!("periodic_phase_test_{index}"),
-                        "test_periodic_phase",
-                    )?),
-                    metrics_manager: metrics_manager.clone(),
-                },
-            )?);
-            runs.push(times);
-        }
+        let capture = crate::operation_tracing::tests::SpanCapture::new();
+        async {
+            let interval = Duration::from_secs(60);
+            let metrics_manager = Arc::new(MetricsManager::new("test_periodic_phase")?);
+            let started = tokio::time::Instant::now();
+            let mut collectors = Vec::new();
+            let mut runs = Vec::new();
+            for index in 0..20_u8 {
+                let endpoint = Arc::new(test_endpoint(mac(&format!("00:11:22:33:44:{index:02x}"))));
+                let times = Arc::new(std::sync::Mutex::new(Vec::new()));
+                collectors.push(Collector::start::<TimedCollector>(
+                    endpoint.clone(),
+                    Arc::clone(endpoint.bmc()),
+                    times.clone(),
+                    CollectorStartContext {
+                        limiter: Arc::new(crate::limiter::NoopLimiter),
+                        iteration_interval: interval,
+                        collector_registry: Arc::new(metrics_manager.create_collector_registry(
+                            format!("periodic_phase_test_{index}"),
+                            "test_periodic_phase",
+                        )?),
+                        metrics_manager: metrics_manager.clone(),
+                    },
+                )?);
+                runs.push(times);
+            }
 
-        tokio::time::sleep(interval * 2).await;
-        for collector in collectors {
-            collector.stop().await;
-        }
-
-        let offsets: Vec<Vec<Duration>> = runs
-            .iter()
-            .map(|runs| {
-                runs.lock()
-                    .unwrap()
-                    .iter()
-                    .map(|run| *run - started)
-                    .collect()
-            })
-            .collect();
-        for runs in &offsets {
+            tokio::time::sleep(interval * 2).await;
+            let run_count: usize = runs.iter().map(|runs| runs.lock().unwrap().len()).sum();
+            let spans = capture.spans();
             assert_eq!(
-                runs[0],
-                Duration::ZERO,
-                "first iteration runs at once: {runs:?}"
+                spans.len(),
+                run_count,
+                "iteration spans close before interval sleeps"
             );
+            assert!(spans.iter().all(|span| {
+                span.name == "health_collection"
+                    && span.parent_span_id == opentelemetry::trace::SpanId::INVALID
+                    && crate::operation_tracing::tests::attribute(span, "outcome").as_deref()
+                        == Some("success")
+                    && crate::operation_tracing::tests::attribute(span, "fetch_failure_count")
+                        .as_deref()
+                        == Some("0")
+                    && crate::operation_tracing::tests::attribute(span, "endpoint_address")
+                        .is_some()
+            }));
+            for collector in collectors {
+                collector.stop().await;
+            }
+
+            let offsets: Vec<Vec<Duration>> = runs
+                .iter()
+                .map(|runs| {
+                    runs.lock()
+                        .unwrap()
+                        .iter()
+                        .map(|run| *run - started)
+                        .collect()
+                })
+                .collect();
+            for runs in &offsets {
+                assert_eq!(
+                    runs[0],
+                    Duration::ZERO,
+                    "first iteration runs at once: {runs:?}"
+                );
+                assert!(
+                    runs[1] < interval,
+                    "second iteration within the first interval: {runs:?}"
+                );
+                assert_eq!(
+                    runs[2] - runs[1],
+                    interval,
+                    "later iterations keep the interval: {runs:?}"
+                );
+            }
+            let second_runs: std::collections::HashSet<Duration> =
+                offsets.iter().map(|runs| runs[1]).collect();
             assert!(
-                runs[1] < interval,
-                "second iteration within the first interval: {runs:?}"
+                second_runs.len() > 1,
+                "second iterations spread out: {second_runs:?}"
             );
-            assert_eq!(
-                runs[2] - runs[1],
-                interval,
-                "later iterations keep the interval: {runs:?}"
-            );
-        }
-        let second_runs: std::collections::HashSet<Duration> =
-            offsets.iter().map(|runs| runs[1]).collect();
-        assert!(
-            second_runs.len() > 1,
-            "second iterations spread out: {second_runs:?}"
-        );
 
-        Ok(())
+            Ok(())
+        }
+        .with_subscriber(capture.dispatch.clone())
+        .await
     }
 }

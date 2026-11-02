@@ -300,57 +300,73 @@ impl GnmiClient {
     async fn connect(&self) -> Result<TonicGnmiClient<Channel>, HealthError> {
         let target = format!("{}:{}", self.host, self.port);
 
-        let uri = http::Uri::builder()
-            .scheme("https")
-            .authority(target.as_str())
-            .path_and_query("/")
-            .build()
-            .map_err(|e| {
-                HealthError::GnmiError(format!(
-                    "switch {}: invalid endpoint URI: {e}",
-                    self.switch_id
-                ))
-            })?;
+        let span = tracing::info_span!(
+            parent: None,
+            "health_gnmi_connect",
+            endpoint_address = %target,
+            switch_id = %self.switch_id,
+            outcome = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
+            logfmt.suppress = true,
+        );
+        crate::operation_tracing::operation(
+            span,
+            async {
+                let uri = http::Uri::builder()
+                    .scheme("https")
+                    .authority(target.as_str())
+                    .path_and_query("/")
+                    .build()
+                    .map_err(|e| {
+                        HealthError::GnmiError(format!(
+                            "switch {}: invalid endpoint URI: {e}",
+                            self.switch_id
+                        ))
+                    })?;
 
-        let endpoint = configure_tls_endpoint(
-            Endpoint::from(uri),
-            &self.switch_id,
-            self.dangerously_skip_tls_verification,
-            self.tls_config.as_ref(),
+                let endpoint = configure_tls_endpoint(
+                    Endpoint::from(uri),
+                    &self.switch_id,
+                    self.dangerously_skip_tls_verification,
+                    self.tls_config.as_ref(),
+                )
+                .await?
+                .connect_timeout(self.request_timeout)
+                .timeout(self.request_timeout)
+                // Periodic HTTP/2 PINGs make transport loss observable when a peer
+                // stops acknowledging frames without closing the Subscribe stream.
+                .http2_keep_alive_interval(GNMI_HTTP2_KEEPALIVE_INTERVAL)
+                .keep_alive_timeout(GNMI_HTTP2_KEEPALIVE_TIMEOUT)
+                .keep_alive_while_idle(true);
+
+                let channel = endpoint.connect().await.map_err(|e| {
+                    HealthError::GnmiError(format!(
+                        "switch {}: connection failed to {target}: {e}",
+                        self.switch_id
+                    ))
+                })?;
+
+                if self.dangerously_skip_tls_verification {
+                    tracing::debug!(
+                        switch_id = %self.switch_id,
+                        target = %target,
+                        rack_id = self.rack_id.as_ref().map(tracing::field::display),
+                        "gNMI TLS channel established with certificate verification disabled"
+                    );
+                } else {
+                    tracing::debug!(
+                        switch_id = %self.switch_id,
+                        target = %target,
+                        rack_id = self.rack_id.as_ref().map(tracing::field::display),
+                        "gNMI TLS channel established"
+                    );
+                }
+
+                Ok(TonicGnmiClient::new(channel))
+            },
+            |result| crate::operation_tracing::Outcome::from(result),
         )
-        .await?
-        .connect_timeout(self.request_timeout)
-        .timeout(self.request_timeout)
-        // Periodic HTTP/2 PINGs make transport loss observable when a peer
-        // stops acknowledging frames without closing the Subscribe stream.
-        .http2_keep_alive_interval(GNMI_HTTP2_KEEPALIVE_INTERVAL)
-        .keep_alive_timeout(GNMI_HTTP2_KEEPALIVE_TIMEOUT)
-        .keep_alive_while_idle(true);
-
-        let channel = endpoint.connect().await.map_err(|e| {
-            HealthError::GnmiError(format!(
-                "switch {}: connection failed to {target}: {e}",
-                self.switch_id
-            ))
-        })?;
-
-        if self.dangerously_skip_tls_verification {
-            tracing::debug!(
-                switch_id = %self.switch_id,
-                target = %target,
-                rack_id = self.rack_id.as_ref().map(tracing::field::display),
-                "gNMI TLS channel established with certificate verification disabled"
-            );
-        } else {
-            tracing::debug!(
-                switch_id = %self.switch_id,
-                target = %target,
-                rack_id = self.rack_id.as_ref().map(tracing::field::display),
-                "gNMI TLS channel established"
-            );
-        }
-
-        Ok(TonicGnmiClient::new(channel))
+        .await
     }
 
     /// Opens a streaming Subscribe RPC whose lifetime belongs to the returned subscription.
@@ -2657,6 +2673,26 @@ mod tests {
             dangerously_skip_tls_verification: true,
             tls_config: None,
         });
+
+        // Channel establishment finishes its span while the channel is still usable.
+        use tracing::instrument::WithSubscriber;
+
+        use crate::operation_tracing::tests::{SpanCapture, attribute};
+        let capture = SpanCapture::new();
+        let channel = client
+            .connect()
+            .with_subscriber(capture.dispatch.clone())
+            .await
+            .unwrap();
+        let spans = capture.spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].name, "health_gnmi_connect");
+        assert_eq!(attribute(&spans[0], "outcome").as_deref(), Some("success"));
+        assert_eq!(
+            attribute(&spans[0], "endpoint_address"),
+            Some(format!("127.0.0.1:{port}"))
+        );
+        drop(channel);
 
         let prefix = system_events_prefix();
         let paths = system_events_subscribe_path();

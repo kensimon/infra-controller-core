@@ -217,7 +217,20 @@ pub(crate) async fn target_endpoint(target: &OtlpTargetConfig) -> Result<Endpoin
 pub(crate) async fn connect_replacement_target(
     target: &OtlpTargetConfig,
 ) -> Result<Channel, HealthError> {
-    connect_replacement_target_with_timeout(target, OTLP_RELOAD_CONNECT_TIMEOUT).await
+    let span = tracing::info_span!(
+        parent: None,
+        "health_otlp_connect",
+        endpoint_address = %crate::operation_tracing::endpoint_address(&target.endpoint),
+        outcome = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
+        logfmt.suppress = true,
+    );
+    crate::operation_tracing::operation(
+        span,
+        connect_replacement_target_with_timeout(target, OTLP_RELOAD_CONNECT_TIMEOUT),
+        |result| crate::operation_tracing::Outcome::from(result),
+    )
+    .await
 }
 
 async fn connect_replacement_target_with_timeout(
@@ -407,7 +420,41 @@ pub(crate) async fn export_items<E: OtlpExport>(
                 .take()
                 .unwrap_or_else(|| export.build(&items[range.clone()], observed_nanos));
 
-            match export.send(request).await {
+            let span = tracing::info_span!(
+                parent: None,
+                "health_otlp_export",
+                endpoint_address = %crate::operation_tracing::endpoint_address(&target.endpoint),
+                ?signal,
+                record_count,
+                attempt,
+                grpc_status_code = tracing::field::Empty,
+                rejected_record_count = tracing::field::Empty,
+                outcome = tracing::field::Empty,
+                otel.status_code = tracing::field::Empty,
+                logfmt.suppress = true,
+            );
+            let result =
+                crate::operation_tracing::operation(span, export.send(request), |result| {
+                    let span = tracing::Span::current();
+                    match result {
+                        Ok(response) => {
+                            span.record("grpc_status_code", 0);
+                            span.record("rejected_record_count", response.rejected_records);
+                            if response.rejected_records != 0 || !response.error_message.is_empty()
+                            {
+                                crate::operation_tracing::Outcome::PartialSuccess
+                            } else {
+                                crate::operation_tracing::Outcome::Success
+                            }
+                        }
+                        Err(status) => {
+                            span.record("grpc_status_code", status.code() as i32);
+                            crate::operation_tracing::Outcome::Error
+                        }
+                    }
+                })
+                .await;
+            match result {
                 Ok(response) => {
                     let acknowledged =
                         response.record(target, signal, record_count, instrumentation);
@@ -938,6 +985,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replacement_connection_spans_report_success_and_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use tracing::instrument::WithSubscriber;
+
+        use crate::operation_tracing::tests::{SpanCapture, attribute};
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let shutdown = cancel.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, axum::Router::new())
+                .with_graceful_shutdown(shutdown.cancelled_owned())
+                .await
+        });
+        for (endpoint, expected) in [
+            (format!("http://{address}"), "success"),
+            ("invalid endpoint".to_string(), "error"),
+        ] {
+            let target = OtlpTargetConfig {
+                endpoint,
+                tls: None,
+                batch_size: 1,
+                queue_capacity: OtlpTargetConfig::DEFAULT_QUEUE_CAPACITY,
+                max_request_bytes: OtlpTargetConfig::DEFAULT_MAX_REQUEST_BYTES,
+                max_concurrent_exports: 1,
+                flush_interval: Duration::from_secs(1),
+                include_diagnostics: false,
+                include_alert_details: false,
+            };
+            let capture = SpanCapture::new();
+            let result = super::connect_replacement_target(&target)
+                .with_subscriber(capture.dispatch.clone())
+                .await;
+            assert_eq!(result.is_ok(), expected == "success");
+            drop(result);
+            let spans = capture.spans();
+            assert_eq!(spans.len(), 1);
+            assert_eq!(spans[0].name, "health_otlp_connect");
+            assert_eq!(attribute(&spans[0], "outcome").as_deref(), Some(expected));
+            assert_eq!(
+                attribute(&spans[0], "endpoint_address"),
+                Some(crate::operation_tracing::endpoint_address(&target.endpoint))
+            );
+        }
+        cancel.cancel();
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn https_target_without_tls_profile_starts_tls_handshake()
     -> Result<(), Box<dyn std::error::Error>> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -1144,6 +1241,10 @@ mod tests {
     /// Runs `export_items` against a fake target that accepts at most 10
     /// bytes, returning every request it saw and the (virtual) time it took.
     async fn run_export(case: ExportCase) -> (Vec<Vec<usize>>, Duration) {
+        use tracing::instrument::WithSubscriber;
+
+        use crate::operation_tracing::tests::{SpanCapture, attribute};
+        let capture = SpanCapture::new();
         let metrics = MetricsCapture::owned();
 
         let mut export = FakeExport {
@@ -1178,6 +1279,7 @@ mod tests {
                 outcome.failed += range.failed;
             },
         )
+        .with_subscriber(capture.dispatch.clone())
         .await;
 
         assert_eq!(
@@ -1188,6 +1290,43 @@ mod tests {
             },
             "splitting and retries must settle each record once",
         );
+        let spans = capture.spans();
+        assert_eq!(
+            spans.len(),
+            export.sent.len(),
+            "one span per actual send, including splits and retries"
+        );
+        for (span, request) in spans.iter().zip(&export.sent) {
+            assert_eq!(span.name, "health_otlp_export");
+            assert_eq!(
+                attribute(span, "record_count"),
+                Some(request.len().to_string())
+            );
+            assert_eq!(
+                attribute(span, "endpoint_address").as_deref(),
+                Some(target.endpoint.as_str())
+            );
+            assert_eq!(attribute(span, "signal").as_deref(), Some("Logs"));
+            assert_eq!(span.parent_span_id, opentelemetry::trace::SpanId::INVALID);
+        }
+        if case.fail_first_attempt {
+            let outcomes: Vec<_> = spans
+                .iter()
+                .map(|span| attribute(span, "outcome").unwrap())
+                .collect();
+            assert!(outcomes.iter().any(|outcome| outcome == "error"));
+            assert_eq!(outcomes.last().map(String::as_str), Some("success"));
+            assert!(
+                spans
+                    .iter()
+                    .any(|span| attribute(span, "attempt").as_deref() == Some("1"))
+            );
+            assert!(
+                spans
+                    .iter()
+                    .any(|span| attribute(span, "grpc_status_code").as_deref() == Some("14"))
+            );
+        }
 
         assert_eq!(
             metrics.counter_delta(
@@ -1201,8 +1340,11 @@ mod tests {
         (export.sent, started.elapsed())
     }
 
-    #[test]
-    fn export_response_counts_only_acknowledged_records() {
+    #[tokio::test]
+    async fn export_response_counts_only_acknowledged_records() {
+        use tracing::instrument::WithSubscriber;
+
+        use crate::operation_tracing::tests::{SpanCapture, attribute};
         let metrics = MetricsCapture::owned();
 
         let target = OtlpTargetConfig {
@@ -1240,6 +1382,67 @@ mod tests {
                 acknowledged =
                     Some(response.record(&target, OtlpSignal::Logs, 3, metrics.instrumentation()));
             });
+            assert_eq!(!logs.is_empty(), warning, "{scenario}");
+
+            struct ResponseExport(super::OtlpExportResponse);
+            impl OtlpExport for ResponseExport {
+                type Item = usize;
+                type Request = Vec<usize>;
+                fn build(&self, items: &[usize], _: u64) -> Vec<usize> {
+                    items.to_vec()
+                }
+                fn record_count(request: &Vec<usize>) -> usize {
+                    request.len()
+                }
+                fn encoded_len(_: &Vec<usize>) -> usize {
+                    1
+                }
+                async fn send(
+                    &mut self,
+                    _: Vec<usize>,
+                ) -> Result<super::OtlpExportResponse, tonic::Status> {
+                    Ok(super::OtlpExportResponse {
+                        rejected_records: self.0.rejected_records,
+                        error_message: self.0.error_message.clone(),
+                    })
+                }
+            }
+            let capture = SpanCapture::new();
+            export_items(
+                &mut ResponseExport(response),
+                &[1, 2, 3],
+                &target,
+                OtlpSignal::Metrics,
+                metrics.instrumentation(),
+                |_| {},
+            )
+            .with_subscriber(capture.dispatch.clone())
+            .await;
+            let spans = capture.spans();
+            assert_eq!(spans.len(), 1, "{scenario}");
+            assert_eq!(
+                attribute(&spans[0], "outcome").as_deref(),
+                Some(if warning {
+                    "partial_success"
+                } else {
+                    "success"
+                }),
+                "{scenario}"
+            );
+            assert_eq!(
+                attribute(&spans[0], "rejected_record_count"),
+                Some(rejected_records.to_string()),
+                "{scenario}"
+            );
+            assert_eq!(attribute(&spans[0], "signal").as_deref(), Some("Metrics"));
+            assert_eq!(
+                spans[0].status,
+                if warning {
+                    opentelemetry::trace::Status::error("")
+                } else {
+                    opentelemetry::trace::Status::Ok
+                }
+            );
 
             assert_eq!(
                 metrics.counter_delta("carbide_health_otlp_egress_records_total", &labels) - before,

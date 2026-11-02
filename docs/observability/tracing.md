@@ -70,9 +70,11 @@ The following binaries build an OTLP span exporter:
 - **NICo REST API services** (`rest-api/common/pkg/otel`), off by default until an OTLP endpoint
   variable is set, plus `tracing.enabled` on nico-rest-api and the workflow workers (see
   [REST service tracing](#7-nico-rest-api-service-tracing)).
+- **nico-hardware-health** (`crates/health/src/main.rs`) - opt-in traces for collection,
+  export, and connection attempts (see [hardware-health tracing](#nico-hardware-health-tracing)).
 
-The other binaries (nico-hardware-health and nico-dsx-exchange-consumer) carry the
-OpenTelemetry crates in the workspace but do not build a span exporter, so they do not emit traces.
+The other binary (nico-dsx-exchange-consumer) carries the OpenTelemetry crates in the
+workspace but does not build a span exporter, so it does not emit traces.
 
 Unless noted otherwise, the rest of this document describes **nico-api** tracing.
 nico-dns differs as described in [nico-dns tracing](#nico-dns-tracing-separate-opt-in).
@@ -299,6 +301,57 @@ routes. It uses the shared setup in `carbide_instrument::otlp_tracing`, enabled 
   read these variables, because it installs `CarbideSpanSampler` instead.
 - **Shutdown.** On SIGTERM, `nico-pxe` stops accepting connections, lets in-flight requests finish, then
   sends the last batch of spans.
+
+### nico-hardware-health tracing
+
+Hardware health exports finite operation spans with `service.name = nico-hardware-health`.
+Independent root spans are useful for investigating slow polling, export failures, and connection
+establishment even though this background collector has no incoming request context. They complement
+the existing metrics and logs; they do not represent an end-to-end hardware-event delivery trace.
+This implements the tracing option evaluated in [issue #5778](https://github.com/dsx-ai-factory/infra-controller/issues/5778).
+
+Span export is off unless a nonempty `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` or
+`OTEL_EXPORTER_OTLP_ENDPOINT` is set at startup. The traces-specific variable takes precedence.
+The shared `carbide_instrument::otlp_tracing` helper exports over OTLP/gRPC. An endpoint rejected
+while building the exporter produces a warning and disables export; delivery failures do not stop
+collection. There is no trace endpoint in the health TOML configuration or runtime tracing toggle.
+Restart the service after changing tracing environment variables.
+
+`NICO_TRACES_SPAN_LEVEL` controls span filtering independently of `RUST_LOG`, defaulting to `info`.
+It accepts `off`, `error`, `warn`, `info`, `debug`, `trace`, or `0`–`5`; invalid values warn and use
+`info`. All hardware-health operation spans are INFO, so `off`, `error`, or `warn` suppress them.
+Standard `OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG` settings control sampling. For example,
+`parentbased_traceidratio` with argument `0.01` samples approximately one percent of operations.
+Without sampling overrides, the shared helper uses the SDK default sampler. Sampling every poll
+can generate substantial trace volume across many targets; choose a ratio appropriate to the site.
+
+| Span | Boundary and fields |
+| --- | --- |
+| `health_collection` | One periodic collector iteration, excluding rate-limit waits and interval sleeps. Includes collector type, endpoint address, refresh flag, optional entity count, and partial fetch failure count. |
+| `health_otlp_export` | One log or metric send attempt, including retries and split requests. Includes target address, signal, record count, zero-based attempt number, numeric gRPC status, and receiver rejection count on a response. |
+| `health_stream_connect` | One shared streaming collector connection attempt, ending when the stream is accepted or connection fails. Includes collector type and endpoint address. |
+| `health_gnmi_connect` | One gNMI channel establishment attempt, including TLS configuration. Includes switch ID and endpoint address. |
+| `health_otlp_connect` | One explicit replacement-channel attempt after OTLP TLS material reload, including TLS configuration. Includes target address. |
+
+Each operation starts its own trace and records `outcome` as `success`, `partial_success`, `error`,
+or `cancelled`. Partial collection failures and OTLP receiver partial-success responses use
+`partial_success`; failures, partial success, and cancellation set OpenTelemetry error status.
+Retries are separate traces, identified by their target, signal, and attempt number. Connection spans
+close before consuming a long-lived stream. Tonic's automatic transport reconnects and stream
+lifetimes are outside this coverage. These spans do not inject trace context into hardware requests.
+
+Only hardware-health spans are exported. Log events and dependency spans are excluded so hardware
+payloads and raw error messages are not attached to traces. OTLP target addresses omit URL credentials,
+paths, queries, and fragments; spans do not contain credentials or certificate material. Routine span
+closure does not add logfmt records. Existing operation logs keep their `RUST_LOG` filtering and can
+carry span correlation while the operation is active.
+
+Tracing is separate from `[sinks.otlp]`, which exports collected hardware logs and metrics, and from
+`[sinks.tracing]`, which writes collected events to the service log. Neither sink enables span export.
+The span exporter uses the shared helper's transport configuration, rather than the hardware sinks'
+TLS profiles or certificate-reload settings. On service termination, including a returned service
+error, the binary shuts down the span exporter and attempts to flush its last batch. Abrupt process
+termination cannot flush pending spans.
 
 ### nico-dhcp tracing
 

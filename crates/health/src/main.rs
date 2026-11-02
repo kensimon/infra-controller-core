@@ -18,9 +18,9 @@
 
 use carbide_health::{Config, HealthError};
 use tracing::level_filters::LevelFilter;
-use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer};
 
 #[tokio::main]
 async fn main() -> Result<(), HealthError> {
@@ -34,16 +34,31 @@ async fn main() -> Result<(), HealthError> {
     // Counts events from startup; `run_service` registers the metric with the
     // framework registry its /metrics response exposes.
     let log_events = carbide_instrument::LogEventsMetric::new("nico-hardware-health");
+    let (span_layer, tracing) = carbide_instrument::otlp_tracing::setup(
+        carbide_instrument::otlp_tracing::Config::new("nico-hardware-health"),
+    );
     tracing_subscriber::registry()
-        .with(log_events.layer())
+        .with(log_events.layer().with_filter(env_filter.clone()))
+        // Collector logs may contain hardware payloads. Export operation spans
+        // only, without attaching log events or dependency spans to them.
         .with(
-            logfmt::layer().with_event_fields([logfmt::EventField::with_default(
-                "component",
-                "nico-hardware-health",
-            )]),
+            span_layer.with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+                metadata.is_span()
+                    && metadata
+                        .module_path()
+                        .is_some_and(|path| path.starts_with("carbide_health::"))
+            })),
         )
-        .with(env_filter)
+        .with(
+            logfmt::layer()
+                .with_event_fields([logfmt::EventField::with_default(
+                    "component",
+                    "nico-hardware-health",
+                )])
+                .with_filter(env_filter),
+        )
         .init();
+    tracing.report();
 
     tracing::info!(
         version = carbide_version::v!(build_version),
@@ -52,18 +67,22 @@ async fn main() -> Result<(), HealthError> {
     );
 
     // SIGTERM and SIGINT cancel this token.
-    let cancel_token = carbide_utils::shutdown_handler::start().map_err(|e| {
-        HealthError::GenericError(format!(
-            "failed to install the shutdown signal handler: {e}"
-        ))
-    })?;
+    let result = async {
+        let cancel_token = carbide_utils::shutdown_handler::start().map_err(|e| {
+            HealthError::GenericError(format!(
+                "failed to install the shutdown signal handler: {e}"
+            ))
+        })?;
 
-    carbide_health::run_service(config, cancel_token).await?;
+        carbide_health::run_service(config, cancel_token).await
+    }
+    .await;
 
     tracing::info!(
         version = carbide_version::v!(build_version),
         "Stopped carbide-hw-health"
     );
 
-    Ok(())
+    tracing.shutdown().await;
+    result
 }
