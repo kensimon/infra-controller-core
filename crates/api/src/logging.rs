@@ -247,8 +247,16 @@ impl ShouldSample for CarbideSpanSampler {
                 SamplingDecision::Drop
             }
         } else if is_carbide_root_span(attributes) {
-            // Root or remote-parented span: record iff explicitly marked `carbide.trace_root`.
-            SamplingDecision::RecordAndSample
+            // Marked ingress spans honor a remote caller's decision. Starting a
+            // new sampled fragment here would defeat upstream head sampling.
+            if parent_span_context
+                .as_ref()
+                .is_none_or(|sc| sc.is_sampled())
+            {
+                SamplingDecision::RecordAndSample
+            } else {
+                SamplingDecision::Drop
+            }
         } else {
             SamplingDecision::Drop
         };
@@ -470,17 +478,18 @@ mod tests {
     }
 
     #[test]
-    fn sampler_remote_parent_gated_by_marker_not_inbound_sampled() {
-        // A remote (ingress) parent never inherits its decision: the local `carbide.trace_root`
-        // marker decides, whether or not the inbound trace was sampled.
+    fn sampler_remote_parent_requires_marker_and_inbound_sampled() {
+        // Only marked ingress spans may continue the remote caller's trace;
+        // an unsampled caller must not produce a disconnected sampled fragment.
         for remote_sampled in [true, false] {
             let parent = parent_ctx(remote_sampled, true);
-            assert!(
+            assert_eq!(
                 matches!(
                     sample_decision_with_parent(true, Some(&parent), root_marker()),
                     SamplingDecision::RecordAndSample
                 ),
-                "marked -> record (inbound sampled={remote_sampled})"
+                remote_sampled,
+                "marked span follows inbound sampled={remote_sampled}"
             );
             assert!(
                 matches!(
@@ -533,63 +542,59 @@ mod tests {
         assert_eq!(result.trace_state, trace_state);
     }
 
-    /// An OpenTelemetry layer is present (an exporter was built) but the `tracing-enabled` flag is
-    /// off, so `CarbideSpanSampler` drops every span. Verifies what NICo forwards on egress in that
-    /// state: does an inbound trace-id still reach a downstream service even though NICo records
-    /// nothing?
-    ///
-    /// Inbound and egress headers are built and asserted as raw `traceparent` strings (the W3C wire
-    /// format), so this test relies only on the propagation entry points NICo actually calls.
+    /// Check the actual tracing layer and wire propagation, including the
+    /// unsampled ingress boundary and the local master switch.
     #[test]
-    fn egress_forwards_trace_id_when_exporter_on_but_flag_off() {
+    fn ingress_sampling_controls_export_and_egress_flags() {
         use opentelemetry::trace::TracerProvider;
         use opentelemetry_sdk::propagation::TraceContextPropagator;
-        use opentelemetry_sdk::trace::SdkTracerProvider;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
         use trace_propagation::{inject_current_context, set_span_parent_from_headers};
         use tracing_subscriber::prelude::*;
 
         global::set_text_map_propagator(TraceContextPropagator::new());
-
-        // OTel layer present ("exporter on"), runtime flag OFF -> the sampler drops everything.
-        let provider = SdkTracerProvider::builder()
-            .with_sampler(CarbideSpanSampler::new(Arc::new(AtomicBool::new(false))))
-            .build();
-        let subscriber = tracing_subscriber::registry()
-            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("carbide")));
-
-        // Inbound: a sampled remote trace as a raw W3C traceparent (final `01` = sampled).
-        let mut inbound = http::HeaderMap::new();
-        inbound.insert(
-            "traceparent",
-            "00-11111111111111111111111111111111-2222222222222222-01"
+        for (enabled, inbound_sampled, expected_sampled) in [
+            (true, true, true),
+            (true, false, false),
+            (false, true, false),
+        ] {
+            let exporter = InMemorySpanExporter::default();
+            let provider = SdkTracerProvider::builder()
+                .with_sampler(CarbideSpanSampler::new(Arc::new(AtomicBool::new(enabled))))
+                .with_simple_exporter(exporter.clone())
+                .build();
+            let subscriber = tracing_subscriber::registry()
+                .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("carbide")));
+            let mut inbound = http::HeaderMap::new();
+            inbound.insert(
+                "traceparent",
+                format!(
+                    "00-11111111111111111111111111111111-2222222222222222-{}",
+                    if inbound_sampled { "01" } else { "00" },
+                )
                 .parse()
                 .unwrap(),
-        );
-
-        let mut egress = http::HeaderMap::new();
-        tracing::subscriber::with_default(subscriber, || {
-            let span = tracing::info_span!("request");
-            set_span_parent_from_headers(&span, &inbound);
-            let _enter = span.enter();
-            inject_current_context(&mut egress);
-        });
-
-        let out = egress
-            .get("traceparent")
-            .expect("egress should still carry a traceparent")
-            .to_str()
-            .unwrap();
-        // The inbound trace-id IS forwarded downstream even though NICo recorded nothing -- the
-        // dropped request span still inherits it (with a fresh child span-id)...
-        assert!(
-            out.starts_with("00-11111111111111111111111111111111-"),
-            "egress must forward the inbound trace-id: {out}"
-        );
-        // ...but it goes out marked NOT sampled, because NICo dropped its span.
-        assert!(
-            out.ends_with("-00"),
-            "egress must be marked not-sampled (NICo dropped its span): {out}"
-        );
+            );
+            let mut egress = http::HeaderMap::new();
+            tracing::subscriber::with_default(subscriber, || {
+                let span = tracing::info_span!("request", carbide.trace_root = true);
+                set_span_parent_from_headers(&span, &inbound);
+                let _enter = span.enter();
+                let child = tracing::info_span!("client");
+                let _child = child.enter();
+                inject_current_context(&mut egress);
+            });
+            let out = egress.get("traceparent").unwrap().to_str().unwrap();
+            assert!(
+                out.starts_with("00-11111111111111111111111111111111-"),
+                "{out}"
+            );
+            assert_eq!(out.ends_with("-01"), expected_sampled, "{out}");
+            provider.force_flush().unwrap();
+            let spans = exporter.get_finished_spans().unwrap();
+            assert_eq!(spans.len(), if expected_sampled { 2 } else { 0 });
+            provider.shutdown().unwrap();
+        }
     }
     #[test]
     fn log_stream_layer_absent_when_admin_ui_disabled() {

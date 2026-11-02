@@ -57,11 +57,11 @@
 //!
 //! # Sampling
 //!
-//! This module installs no sampler, so `OTEL_TRACES_SAMPLER` and
-//! `OTEL_TRACES_SAMPLER_ARG` take effect. Prefer `parentbased_traceidratio`,
+//! `OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG` override service defaults.
+//! Prefer `parentbased_traceidratio`,
 //! which applies the ratio only where a trace starts. A sampler drops spans
-//! before the collector sees them, so keep the default if the collector picks
-//! traces by latency or errors.
+//! before the collector sees them. Use `always_on` if a collector must receive
+//! all traces before selecting by latency or errors.
 
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::{KeyValue, global};
@@ -97,6 +97,9 @@ pub struct Config {
     pub default_span_level: LevelFilter,
     /// Excludes the crates listed in [`TRANSPORT_CRATES`] from span export.
     pub exclude_transport_crates: bool,
+    /// Sampler used only when `OTEL_TRACES_SAMPLER` is unset. `None` keeps
+    /// the SDK default. Standard sampler variables take precedence.
+    pub default_sampler: Option<opentelemetry_sdk::trace::Sampler>,
 }
 
 impl Config {
@@ -107,6 +110,7 @@ impl Config {
             config_endpoint: None,
             default_span_level: LevelFilter::INFO,
             exclude_transport_crates: true,
+            default_sampler: None,
         }
     }
 
@@ -121,6 +125,14 @@ impl Config {
     #[must_use]
     pub fn with_default_span_level(mut self, level: LevelFilter) -> Self {
         self.default_span_level = level;
+        self
+    }
+
+    /// Sets sampling when `OTEL_TRACES_SAMPLER` is unset. An argument alone
+    /// (`OTEL_TRACES_SAMPLER_ARG`) does not override this fallback.
+    #[must_use]
+    pub fn with_default_sampler(mut self, sampler: opentelemetry_sdk::trace::Sampler) -> Self {
+        self.default_sampler = Some(sampler);
         self
     }
 
@@ -273,7 +285,11 @@ where
         None => (None, State::Off),
         Some(endpoint) => match build_span_exporter(&endpoint) {
             Ok(exporter) => (
-                Some(build_tracer_provider(exporter, config.service_name)),
+                Some(build_tracer_provider(
+                    exporter,
+                    config.service_name,
+                    config.default_sampler,
+                )),
                 State::On { endpoint },
             ),
             Err(error) => (None, State::Failed { endpoint, error }),
@@ -348,12 +364,19 @@ fn build_span_exporter(
         .build()
 }
 
-/// Leaves sampling to the SDK so `OTEL_TRACES_SAMPLER` works.
+/// Standard sampler variables override the service fallback.
 fn build_tracer_provider(
-    exporter: opentelemetry_otlp::SpanExporter,
+    exporter: impl opentelemetry_sdk::trace::SpanExporter + 'static,
     service_name: &'static str,
+    default_sampler: Option<opentelemetry_sdk::trace::Sampler>,
 ) -> SdkTracerProvider {
-    SdkTracerProvider::builder()
+    let mut builder = SdkTracerProvider::builder();
+    if std::env::var_os("OTEL_TRACES_SAMPLER").is_none()
+        && let Some(sampler) = default_sampler
+    {
+        builder = builder.with_sampler(sampler);
+    }
+    builder
         .with_batch_exporter(exporter)
         .with_resource(
             Resource::builder()
@@ -408,6 +431,67 @@ mod tests {
     use carbide_test_support::value_scenarios;
 
     use super::*;
+
+    #[test]
+    fn service_sampler_defaults_yield_to_standard_configuration() {
+        // Isolate SDK environment configuration from other tests.
+        const CHILD: &str = "NICO_TEST_SAMPLER_CHILD";
+        if let Ok(expected) = std::env::var(CHILD) {
+            use opentelemetry::trace::{Span as _, TraceContextExt, Tracer as _};
+            use opentelemetry_sdk::trace::{InMemorySpanExporter, Sampler};
+
+            let exporter = InMemorySpanExporter::default();
+            let provider = build_tracer_provider(
+                exporter.clone(),
+                "sampler-test",
+                Some(Sampler::ParentBased(Box::new(Sampler::AlwaysOff))),
+            );
+            let tracer = provider.tracer("test");
+            for _ in 0..2 {
+                let root = tracer.start("root");
+                let context = opentelemetry::Context::new().with_span(root);
+                let mut child = tracer.start_with_context("child", &context);
+                child.end();
+                context.span().end();
+            }
+            provider.force_flush().unwrap();
+            assert_eq!(
+                exporter.get_finished_spans().unwrap().len(),
+                expected.parse::<usize>().unwrap()
+            );
+            provider.shutdown().unwrap();
+            return;
+        }
+        for (sampler, argument, expected) in [
+            (None, None, 0),
+            (None, Some("1"), 0), // An argument alone does not select a sampler.
+            (Some("always_on"), None, 4),
+            (Some("parentbased_traceidratio"), Some("1"), 4),
+        ] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "otlp_tracing::tests::service_sampler_defaults_yield_to_standard_configuration",
+                ])
+                .env(CHILD, expected.to_string())
+                .env_remove("OTEL_TRACES_SAMPLER")
+                .env_remove("OTEL_TRACES_SAMPLER_ARG");
+            if let Some(sampler) = sampler {
+                command.env("OTEL_TRACES_SAMPLER", sampler);
+            }
+            if let Some(argument) = argument {
+                command.env("OTEL_TRACES_SAMPLER_ARG", argument);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "sampler={sampler:?}, argument={argument:?}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 
     #[derive(Clone, Copy)]
     struct EndpointInputs {

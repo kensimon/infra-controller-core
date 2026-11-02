@@ -175,9 +175,10 @@ nico-api uses a custom `CarbideSpanSampler`:
     deliberate roots (the state-controller reconcile loops and site-explorer)
 - **In-process child spans inherit the root's decision**, so once a trace is sampled the whole call tree beneath
   it is captured - **except tokio spans, which are always dropped** (they leak and would exhaust memory).
-- For a span parented to a **remote** (ingress-extracted) trace, the decision stays local: an inbound `sampled`
-  flag does not override `tracing_enabled` (see
-  [W3C trace-context propagation](#w3c-trace-context-propagation)).
+- A **remote** (ingress-extracted) parent must be sampled for a marked ingress span to record.
+  Unsampled callers remain unsampled, avoiding API fragments of dropped traces. The local
+  `tracing_enabled` toggle and marker are still required; a sampled caller cannot enable tracing
+  locally (see [W3C trace-context propagation](#w3c-trace-context-propagation)).
 - The exporter resource is `service.name = carbide-api`; the tracer is named `carbide`.
 
 ### How traces leave nico-api
@@ -322,10 +323,17 @@ Restart the service after changing tracing environment variables.
 It accepts `off`, `error`, `warn`, `info`, `debug`, `trace`, or `0`–`5`; invalid values warn and use
 `info`. BMC HTTP spans are DEBUG and require `NICO_TRACES_SPAN_LEVEL=debug` (or `trace`).
 Summary and API client spans are INFO; `off`, `error`, or `warn` suppress them.
-Standard `OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG` settings control sampling. For example,
-`parentbased_traceidratio` with argument `0.01` samples approximately one percent of operations.
-Without sampling overrides, the shared helper uses the SDK default sampler. Sampling every poll
-can generate substantial trace volume across many targets; choose a ratio appropriate to the site.
+Health defaults to parent-based head sampling with a 1% ratio for new traces. To change the ratio,
+set both `OTEL_TRACES_SAMPLER=parentbased_traceidratio` and `OTEL_TRACES_SAMPLER_ARG` (a number from
+`0` to `1`). Use `OTEL_TRACES_SAMPLER=always_on` for a full diagnostic capture. An argument alone
+leaves the default unchanged. An explicitly selected sampler uses the standard SDK's parsing and
+fallback behavior, including its 100% fallback for an invalid ratio argument.
+
+Children, queued submissions, and NICo API request spans follow the parent's decision. Head sampling
+also drops some failed and slow operations; operational metrics and logs remain independent of trace
+sampling. Tail sampling is optional and is not deployed by Tilt. It would require a collector to
+receive complete traces before deciding which to retain, so it would not reduce source export cost.
+Tempo's span metrics and service graphs describe sampled traffic, not total request counts.
 
 | Span | Boundary and fields |
 | --- | --- |
@@ -467,7 +475,8 @@ through nico-api. The standard `TraceContextPropagator` is installed once at sta
     the MQTT OAuth2 token provider, and firmware downloads.
 - **Interaction with the enable flag.** `tracing-enabled` is the master switch for what nico-api
   *records*: an inbound `sampled` flag never turns recording on here. When `tracing-enabled` is on, the inbound
-  `trace_id` is inherited, so nico-api's spans join the caller's trace.
+  `trace_id` and sampling decision are inherited at marked ingress spans, so nico-api joins sampled
+  caller traces and does not record fragments of unsampled ones.
 - **Forwarding vs. recording.** Forwarding the context is separate from recording it, but both currently
   depend on the exporter being built:
   - *Exporter built, tracing off:* records nothing, yet still forwards the inbound `trace_id` and `tracestate`

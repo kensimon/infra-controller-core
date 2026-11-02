@@ -57,6 +57,7 @@ test-support = [
 ]
 
 [dev-dependencies]
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 carbide-instrument = { path = ".", features = ["otlp-tracing", "test-support"] }
 carbide-test-support = { path = "../test-support" }
 futures-util = { workspace = true }

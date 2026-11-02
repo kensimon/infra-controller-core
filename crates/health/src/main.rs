@@ -35,7 +35,11 @@ async fn main() -> Result<(), HealthError> {
     // framework registry its /metrics response exposes.
     let log_events = carbide_instrument::LogEventsMetric::new("nico-hardware-health");
     let (span_layer, tracing) = carbide_instrument::otlp_tracing::setup(
-        carbide_instrument::otlp_tracing::Config::new("nico-hardware-health"),
+        carbide_instrument::otlp_tracing::Config::new("nico-hardware-health").with_default_sampler(
+            opentelemetry_sdk::trace::Sampler::ParentBased(Box::new(
+                opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(0.01),
+            )),
+        ),
     );
     tracing_subscriber::registry()
         .with(log_events.layer().with_filter(env_filter.clone()))

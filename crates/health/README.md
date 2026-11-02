@@ -77,7 +77,11 @@ Set `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` to an OTLP/gRPC collector endpoint befo
 service. `OTEL_EXPORTER_OTLP_ENDPOINT` is the fallback; with neither variable set, span export stays
 off. `NICO_TRACES_SPAN_LEVEL` defaults to `info` and filters spans independently of `RUST_LOG`.
 BMC HTTP spans require `NICO_TRACES_SPAN_LEVEL=debug`; summary and API spans remain at INFO.
-Standard `OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG` settings control sampling. Tracing settings
+Health defaults to parent-based head sampling at 1% of new traces. Set
+`OTEL_TRACES_SAMPLER=parentbased_traceidratio` and `OTEL_TRACES_SAMPLER_ARG` to a ratio from `0` to `1`
+to change it, or use `OTEL_TRACES_SAMPLER=always_on` for a full diagnostic capture. An argument alone
+leaves the default unchanged. Standard SDK sampler names and fallback behavior apply when a sampler
+is explicitly selected. Tracing settings
 require a restart. There are no additional TOML settings.
 
 Span export is separate from `[sinks.otlp]` (hardware telemetry export) and `[sinks.tracing]`

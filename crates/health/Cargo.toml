@@ -53,6 +53,7 @@ hyper-util = { workspace = true, features = [
 mac_address = { workspace = true }
 metrics-endpoint = { path = "../metrics-endpoint" }
 opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
 opentelemetry-proto = { workspace = true, default-features = false, features = [
   "gen-tonic",
   "logs",
