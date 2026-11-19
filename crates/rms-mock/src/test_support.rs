@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-//! MockRmsApi is a configurable mock implementation of librms::RmsApi.
+//! A configurable mock implementation of [`librms::RmsApi`] for tests.
 //!
 //! The idea is tests queue up responses for each method they care about
 //! and want to test, then hand an `Arc<MockRmsApi>` to the code under test.
